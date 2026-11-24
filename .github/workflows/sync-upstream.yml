@@ -12,12 +12,13 @@ concurrency:
 env:
   UPSTREAM_REPO: icco/reportd
   UPSTREAM_BRANCH: main
-  SELF: .github/workflows/sync-upstream.yml
 jobs:
   sync:
     runs-on: ubuntu-latest
     # Upstream itself has nothing to pull from.
     if: github.repository != 'icco/reportd'
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -39,12 +40,17 @@ jobs:
 
           git merge --no-commit --no-ff "upstream/${UPSTREAM_BRANCH}" || true
 
-          # This repository keeps no workflow but this one. Drop whatever
-          # upstream added or changed under .github/workflows; that also
-          # settles the conflicts its edits to the deleted files cause, and
-          # keeps the push within what the default GITHUB_TOKEN may do.
-          git ls-files -- .github/workflows | sort -u |
-            grep -vx "${SELF}" | xargs -r git rm -f -q --
+          # Workflows are owned by this repository: keep its own exactly as
+          # they are and drop whatever upstream added or changed. That also
+          # settles the conflicts upstream's edits to deleted workflows
+          # cause, and keeps the push within what GITHUB_TOKEN may do.
+          git ls-files -- .github/workflows | sort -u | while read -r f; do
+            if git cat-file -e "HEAD:${f}" 2>/dev/null; then
+              git checkout -q HEAD -- "${f}"
+            else
+              git rm -f -q -- "${f}"
+            fi
+          done
 
           conflicts="$(git diff --name-only --diff-filter=U)"
           if [ -n "${conflicts}" ]; then
@@ -70,3 +76,12 @@ jobs:
       - name: Push
         if: steps.merge.outputs.changed == 'true'
         run: git push origin HEAD:main
+  # The push above uses GITHUB_TOKEN, which raises no push event, so the
+  # image build is started from here instead.
+  publish:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    uses: ./.github/workflows/publish.yml
+    with:
+      ref: main
+    secrets: inherit

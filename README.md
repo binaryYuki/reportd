@@ -122,19 +122,21 @@ docker run -p 8080:8080 \
   -e REPORTD_GITHUB_CLIENT_SECRET=your-client-secret \
   -e REPORTD_ALLOWED_EMAILS=you@example.com \
   -e REPORTD_SESSION_SECRET=a-long-random-string-of-32-or-more-chars \
-  ghcr.io/icco/reportd
+  akkk1234/reportd
 ```
 
 ### Docker Compose (self-hosting)
 
-The example below runs reportd with its own MySQL database in a single `docker compose up -d`.
+[`compose.yaml`](compose.yaml) is a ready-to-use example for running reportd against an external database such as MySQL HeatWave: it reads its settings from a `.env` file and applies limits for a 0.1 vCPU / 512 MB instance.
+
+The example below instead runs reportd with its own MySQL database in a single `docker compose up -d`.
 
 Save this as `docker-compose.yml`:
 
 ```yaml
 services:
   reportd:
-    image: ghcr.io/icco/reportd:main
+    image: akkk1234/reportd:latest
     restart: unless-stopped
     ports:
       - "8080:8080"
@@ -205,7 +207,13 @@ TEST_MYSQL_URL=mysql://root:reportd@localhost:3306/reportd go test ./pkg/db/
 
 `.github/workflows/sync-upstream.yml` merges [icco/reportd](https://github.com/icco/reportd) `main` into this repository's `main` every day (and on demand from the Actions tab). The merge is built and tested before it is pushed. When upstream conflicts with local changes, or the merged code fails its tests, the run fails and nothing is pushed; merge by hand in that case.
 
-This repository keeps no other workflow: anything upstream adds or changes under `.github/workflows` is dropped during the merge.
+Workflows belong to this repository: anything upstream adds or changes under `.github/workflows` is dropped during the merge.
+
+## Docker image
+
+`.github/workflows/publish.yml` builds a multi-arch image (`linux/amd64`, `linux/arm64`) and pushes it to Docker Hub as `akkk1234/reportd` on every push to `main`, after every upstream sync that brought in changes, and on demand from the Actions tab. Each build is tagged `latest` and `sha-<commit>`.
+
+It needs two repository secrets: `DOCKERHUB_USERNAME`, and `DOCKERHUB_TOKEN` holding a Docker Hub access token with write access to the repository.
 
 ## Integrating with your site
 

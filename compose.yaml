@@ -1,0 +1,39 @@
+# Example deployment of reportd against an external MySQL database (for
+# example Oracle MySQL HeatWave).
+#
+#   1. Copy this file and create a .env file next to it with the variables
+#      marked "required" below.
+#   2. docker compose up -d
+#
+# Put a reverse proxy that terminates HTTPS in front of port 8080 and have it
+# send "X-Forwarded-Proto: https". Register https://<your-host>/auth/callback
+# as the GitHub OAuth app's authorization callback URL.
+services:
+  reportd:
+    # "latest" follows main. Pin a build with akkk1234/reportd:sha-<commit>.
+    image: akkk1234/reportd:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # required: mysql://user:password@host:3306/database?tls=true
+      REPORTD_DATABASE_URL: ${REPORTD_DATABASE_URL:?set REPORTD_DATABASE_URL in .env}
+      # required: GitHub OAuth app credentials
+      REPORTD_GITHUB_CLIENT_ID: ${REPORTD_GITHUB_CLIENT_ID:?set REPORTD_GITHUB_CLIENT_ID in .env}
+      REPORTD_GITHUB_CLIENT_SECRET: ${REPORTD_GITHUB_CLIENT_SECRET:?set REPORTD_GITHUB_CLIENT_SECRET in .env}
+      # required: comma-separated emails allowed to sign in
+      REPORTD_ALLOWED_EMAILS: ${REPORTD_ALLOWED_EMAILS:?set REPORTD_ALLOWED_EMAILS in .env}
+      # required: 32+ random characters, e.g. from `openssl rand -hex 32`.
+      # Sessions survive restarts only when this stays the same.
+      REPORTD_SESSION_SECRET: ${REPORTD_SESSION_SECRET:?set REPORTD_SESSION_SECRET in .env}
+      # Oldest rows are deleted beyond this many GB of table storage.
+      REPORTD_MAX_STORAGE_GB: ${REPORTD_MAX_STORAGE_GB:-5}
+      # Make the Go runtime collect garbage before the memory limit below.
+      GOMEMLIMIT: 400MiB
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: 512M
+    # Lets queued reports be written out before the container is killed.
+    stop_grace_period: 20s
