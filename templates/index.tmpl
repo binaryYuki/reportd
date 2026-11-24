@@ -36,6 +36,12 @@
         Browser reporting and Web Vitals dashboard.
         <a class="underline" href="https://github.com/icco/reportd">Source on GitHub</a>.
       </p>
+      {{if .User}}
+      <form method="post" action="/auth/logout" class="mt-2 text-sm text-gray-500">
+        Signed in as {{ .User }}.
+        <button type="submit" class="underline hover:text-white">Sign out</button>
+      </form>
+      {{end}}
     </header>
 
     <main>

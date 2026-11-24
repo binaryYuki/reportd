@@ -66,7 +66,8 @@ func main() {
 	// Clean up bad data from previous shell-script migration.
 	log.Println("==> Cleaning up bad migration data...")
 	for _, table := range []string{"web_vitals", "report_to_entries", "security_report_entries"} {
-		res := pgDB.Exec(fmt.Sprintf(`DELETE FROM %s WHERE service ~ '^\d{4}-\d{2}-\d{2}' OR service = ''`, table))
+		// Date-prefixed service names; LIKE keeps this portable across dialects.
+		res := pgDB.Exec(fmt.Sprintf(`DELETE FROM %s WHERE service LIKE '____-__-__%%' OR service = ''`, table))
 		if res.Error != nil {
 			log.Printf("    warning: cleaning %s: %v", table, res.Error)
 		} else {

@@ -5,4 +5,3 @@ Disallow: /reports/
 Disallow: /analytics/
 Disallow: /report/
 Disallow: /reporting/
-Disallow: /healthz

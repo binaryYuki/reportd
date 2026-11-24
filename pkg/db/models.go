@@ -1,10 +1,46 @@
 package db
 
 import (
+	"database/sql/driver"
+	"fmt"
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
+
+// JSONText is a raw JSON document stored in the dialect's JSON column type.
+type JSONText string
+
+// GormDBDataType picks the JSON column type per dialect: MySQL has no jsonb.
+// SQLite keeps "jsonb" (it accepts any type name) so existing files are not
+// rewritten by AutoMigrate.
+func (JSONText) GormDBDataType(d *gorm.DB, _ *schema.Field) string {
+	if d.Name() == dialectMySQL {
+		return "json"
+	}
+	return "jsonb"
+}
+
+// Value implements driver.Valuer.
+func (j JSONText) Value() (driver.Value, error) {
+	return string(j), nil
+}
+
+// Scan implements sql.Scanner.
+func (j *JSONText) Scan(v any) error {
+	switch x := v.(type) {
+	case nil:
+		*j = ""
+	case []byte:
+		*j = JSONText(x)
+	case string:
+		*j = JSONText(x)
+	default:
+		return fmt.Errorf("unsupported type for JSONText: %T", v)
+	}
+	return nil
+}
 
 // WebVital is a row from POST /analytics.
 type WebVital struct {
@@ -35,7 +71,7 @@ type ReportToEntry struct {
 	LineNumber         int            `json:"line_number"`
 	ColumnNumber       int            `json:"column_number"`
 	StatusCode         int            `json:"status_code"`
-	RawJSON            string         `gorm:"type:jsonb" json:"raw_json,omitempty"`
+	RawJSON            JSONText       `json:"raw_json,omitempty"`
 }
 
 // SecurityReportEntry is a row from POST /reporting (Reporting API v1).
@@ -54,5 +90,5 @@ type SecurityReportEntry struct {
 	LineNumber         int            `json:"line_number"`
 	ColumnNumber       int            `json:"column_number"`
 	Message            string         `json:"message"`
-	RawJSON            string         `gorm:"type:jsonb" json:"raw_json,omitempty"`
+	RawJSON            JSONText       `json:"raw_json,omitempty"`
 }

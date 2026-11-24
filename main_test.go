@@ -30,6 +30,27 @@ type recordingWriters struct {
 	doneAnalytics   chan struct{}
 	doneReport      chan struct{}
 	doneSecurityRpt chan struct{}
+
+	// ingest is the router's async writer; droppedRows counts what it lost.
+	ingest      *db.Writer
+	droppedRows int
+}
+
+// flush waits for the async writer to persist (or drop) everything posted so
+// far, so a test can then assert on the database.
+func (w *recordingWriters) flush(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := w.ingest.Flush(ctx); err != nil {
+		t.Fatalf("flushing ingest writer: %v", err)
+	}
+}
+
+func (w *recordingWriters) dropped() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.droppedRows
 }
 
 func newRecordingWriters() *recordingWriters {
@@ -76,7 +97,20 @@ func newTestRouter(t *testing.T) (http.Handler, *gorm.DB, *recordingWriters) {
 		t.Fatalf("db.AutoMigrate: %v", err)
 	}
 	rec := newRecordingWriters()
-	router := newRouter(pgDB, rec.writeReport, rec.writeAnalytics, rec.writeSecurityReport)
+	rec.ingest = db.NewWriter(pgDB, db.WriterOptions{
+		RetryBackoff: time.Millisecond,
+		OnDrop: func(rows int, _ error) {
+			rec.mu.Lock()
+			rec.droppedRows += rows
+			rec.mu.Unlock()
+		},
+	})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = rec.ingest.Close(ctx)
+	})
+	router := newRouter(pgDB, rec.ingest, rec.writeReport, rec.writeAnalytics, rec.writeSecurityReport, nil)
 	return router, pgDB, rec
 }
 
@@ -115,9 +149,9 @@ func TestRobotsTxtHandler(t *testing.T) {
 	}
 }
 
-func TestHealthzHandler(t *testing.T) {
+func TestStatusHandler(t *testing.T) {
 	h, _, _ := newTestRouter(t)
-	rr := do(t, h, http.MethodGet, "/healthz", nil, "")
+	rr := do(t, h, http.MethodGet, "/api/status", nil, "")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rr.Code)
 	}
@@ -419,6 +453,8 @@ func TestPostReportHandler(t *testing.T) {
 		t.Fatalf("valid: status = %d, want 204, body=%s", rr.Code, rr.Body.String())
 	}
 
+	rec.flush(t)
+
 	var count int64
 	if err := pgDB.Model(&db.ReportToEntry{}).Where("service = ?", "svc").Count(&count).Error; err != nil {
 		t.Fatalf("count: %v", err)
@@ -450,6 +486,8 @@ func TestPostAnalyticsHandler(t *testing.T) {
 	if rr.Code != http.StatusNoContent {
 		t.Fatalf("valid: status = %d, want 204, body=%s", rr.Code, rr.Body.String())
 	}
+
+	rec.flush(t)
 
 	var count int64
 	if err := pgDB.Model(&db.WebVital{}).Where("service = ?", "svc").Count(&count).Error; err != nil {
@@ -488,6 +526,8 @@ func TestPostReportingHandler(t *testing.T) {
 		t.Fatalf("valid: status = %d, want 204, body=%s", rr.Code, rr.Body.String())
 	}
 
+	rec.flush(t)
+
 	var count int64
 	if err := pgDB.Model(&db.SecurityReportEntry{}).Where("service = ?", "svc").Count(&count).Error; err != nil {
 		t.Fatalf("count: %v", err)
@@ -511,6 +551,8 @@ func TestPostReportingHandlerLegacyCSP(t *testing.T) {
 	if rr.Code != http.StatusNoContent {
 		t.Fatalf("valid: status = %d, want 204, body=%s", rr.Code, rr.Body.String())
 	}
+
+	rec.flush(t)
 
 	var entries []db.SecurityReportEntry
 	if err := pgDB.Where("service = ?", "svc").Find(&entries).Error; err != nil {
@@ -588,7 +630,7 @@ func TestRouteTagMiddleware(t *testing.T) {
 	// path with an otelhttp labeler in the context does not panic. Since the
 	// router's middleware stack wraps requests anyway, a normal request is a
 	// sufficient smoke test.
-	rr := do(t, h, http.MethodGet, "/healthz", nil, "")
+	rr := do(t, h, http.MethodGet, "/api/status", nil, "")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("routed request failed: %d", rr.Code)
 	}

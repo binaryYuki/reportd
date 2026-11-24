@@ -17,6 +17,8 @@ func TestDialector(t *testing.T) {
 		{name: "sqlite scheme", url: "sqlite:///tmp/x.db", wantDialect: dialectSQLite},
 		{name: "sqlite scheme with empty dsn", url: "sqlite://", wantErr: true},
 		{name: "file prefix", url: "file::memory:", wantDialect: dialectSQLite},
+		{name: "mysql scheme", url: "mysql://root@localhost/reportd", wantDialect: dialectMySQL},
+		{name: "mysql scheme without database", url: "mysql://root@localhost", wantErr: true},
 		{name: "anything else is postgres", url: "postgres://localhost/db", wantDialect: "postgres"},
 	}
 

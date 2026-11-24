@@ -48,7 +48,7 @@ func ReportToEntriesFromReport(r *reportto.Report) []*ReportToEntry {
 			LineNumber:         r.CSP.CSPReport.LineNumber,
 			ColumnNumber:       r.CSP.CSPReport.ColumnNumber,
 			StatusCode:         r.CSP.CSPReport.StatusCode,
-			RawJSON:            string(raw),
+			RawJSON:            JSONText(raw),
 		}}
 	}
 
@@ -58,7 +58,7 @@ func ReportToEntriesFromReport(r *reportto.Report) []*ReportToEntry {
 			CreatedAt:  now,
 			Service:    srv,
 			ReportType: "expect-ct",
-			RawJSON:    string(raw),
+			RawJSON:    JSONText(raw),
 		}}
 	}
 
@@ -77,7 +77,7 @@ func ReportToEntriesFromReport(r *reportto.Report) []*ReportToEntry {
 			LineNumber:         int(rt.Body.LineNumber),
 			ColumnNumber:       int(rt.Body.ColumnNumber),
 			StatusCode:         int(rt.Body.StatusCode),
-			RawJSON:            string(raw),
+			RawJSON:            JSONText(raw),
 		}
 		if rt.Body.Directive != "" {
 			entry.ViolatedDirective = rt.Body.Directive
@@ -97,7 +97,7 @@ func SecurityReportEntryFromReport(sr *reporting.SecurityReport) *SecurityReport
 		CreatedAt:  time.Now(),
 		Service:    sr.Service.StringVal,
 		ReportType: sr.ReportType.StringVal,
-		RawJSON:    sr.RawJSON,
+		RawJSON:    JSONText(sr.RawJSON),
 	}
 
 	switch {

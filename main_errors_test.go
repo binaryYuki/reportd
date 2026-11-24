@@ -51,7 +51,8 @@ func TestHandlerStorageErrors(t *testing.T) {
 	}
 }
 
-// The insert-failure branch: the payload parses, then the write has nowhere to go.
+// Ingestion never fails on storage: the client still gets its 204 and the
+// rows are dropped (and reported) once the background retries run out.
 func TestIngestStorageErrors(t *testing.T) {
 	const (
 		reportToBody  = `{"csp-report":{"document-uri":"https://example.com/","blocked-uri":"https://evil.com/","violated-directive":"script-src"}}`
@@ -71,12 +72,17 @@ func TestIngestStorageErrors(t *testing.T) {
 		{"postReporting", &db.SecurityReportEntry{}, "/reporting/svc", reportingBody, "application/reports+json"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			h, pgDB, _ := newTestRouter(t)
+			h, pgDB, rec := newTestRouter(t)
 			dropModel(t, pgDB, tt.model)
 
 			rr := do(t, h, http.MethodPost, tt.target, strings.NewReader(tt.body), tt.contentType)
-			if rr.Code != http.StatusInternalServerError {
-				t.Errorf("status = %d, want 500 (body=%q)", rr.Code, rr.Body.String())
+			if rr.Code != http.StatusNoContent {
+				t.Errorf("status = %d, want 204 (body=%q)", rr.Code, rr.Body.String())
+			}
+
+			rec.flush(t)
+			if got := rec.dropped(); got != 1 {
+				t.Errorf("dropped rows = %d, want 1", got)
 			}
 		})
 	}
@@ -118,7 +124,7 @@ func TestIngestTruncatedBodies(t *testing.T) {
 	core, logs := observer.New(zap.WarnLevel)
 	log = zap.New(core).Sugar()
 	t.Cleanup(func() { log = previousLog })
-	h := newRouter(nil, nil, nil, nil)
+	h := newRouter(nil, nil, nil, nil, nil, nil)
 
 	for _, tc := range []struct {
 		target      string
@@ -213,5 +219,67 @@ func TestServiceValidationRejectsOverlongName(t *testing.T) {
 				t.Errorf("status = %d, want 400 (body=%q)", rr.Code, rr.Body.String())
 			}
 		})
+	}
+}
+
+func TestIngestRejectsOversizedBody(t *testing.T) {
+	h, _, _ := newTestRouter(t)
+
+	body := strings.NewReader(`{"name":"` + strings.Repeat("x", maxIngestBodyBytes) + `"}`)
+	rr := do(t, h, http.MethodPost, "/analytics/svc", body, "application/json")
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413", rr.Code)
+	}
+}
+
+// Uploads always get 204, so /api/status is where a failing write shows up:
+// 503 "orm: error <code>" until a later batch is written.
+func TestStatusReportsWriteErrors(t *testing.T) {
+	const analyticsBody = `{"id":"v1-abc","name":"LCP","value":2500,"delta":100,"label":"web-vital"}`
+	h, pgDB, rec := newTestRouter(t)
+
+	status := func() *httptest.ResponseRecorder {
+		return do(t, h, http.MethodGet, "/api/status", nil, "")
+	}
+	post := func() {
+		t.Helper()
+		rr := do(t, h, http.MethodPost, "/analytics/svc", strings.NewReader(analyticsBody), "application/json")
+		if rr.Code != http.StatusNoContent {
+			t.Fatalf("POST status = %d, want 204", rr.Code)
+		}
+		rec.flush(t)
+	}
+
+	if rr := status(); rr.Code != http.StatusOK || rr.Body.String() != "ok." {
+		t.Fatalf("before any write: %d %q, want 200 ok.", rr.Code, rr.Body.String())
+	}
+
+	dropModel(t, pgDB, &db.WebVital{})
+	post()
+	rr := status()
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("after a failed write: status = %d, want 503", rr.Code)
+	}
+	// SQLite result code 1 (SQLITE_ERROR) is what a missing table yields.
+	if got, want := rr.Body.String(), "orm: error 1"; got != want {
+		t.Errorf("body = %q, want %q", got, want)
+	}
+	if strings.Contains(rr.Body.String(), "web_vitals") {
+		t.Errorf("body leaks the underlying error: %q", rr.Body.String())
+	}
+
+	if err := db.AutoMigrate(t.Context(), pgDB); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+	post()
+	if rr := status(); rr.Code != http.StatusOK {
+		t.Errorf("after recovery: status = %d %q, want 200", rr.Code, rr.Body.String())
+	}
+}
+
+func TestOldHealthzPathIsGone(t *testing.T) {
+	h, _, _ := newTestRouter(t)
+	if rr := do(t, h, http.MethodGet, "/healthz", nil, ""); rr.Code != http.StatusNotFound {
+		t.Errorf("/healthz status = %d, want 404", rr.Code)
 	}
 }

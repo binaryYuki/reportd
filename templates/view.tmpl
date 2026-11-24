@@ -35,6 +35,12 @@
     <header class="mb-10">
       <h1 class="text-3xl font-bold"><a href="/" class="hover:underline">ReportD</a> <span class="text-gray-500">/</span> {{ .Service }}</h1>
       <div class="hidden" id="name">{{ .Service }}</div>
+      {{if .User}}
+      <form method="post" action="/auth/logout" class="mt-2 text-sm text-gray-500">
+        Signed in as {{ .User }}.
+        <button type="submit" class="underline hover:text-white">Sign out</button>
+      </form>
+      {{end}}
     </header>
 
     <!-- Core Web Vitals -->

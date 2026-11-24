@@ -46,7 +46,7 @@ func TestHandlerWriteErrors(t *testing.T) {
 		name    string
 		handler http.HandlerFunc
 	}{
-		{"healthz", healthzHandler()},
+		{"status", statusHandler(nil)},
 		{"robotsTxt", robotsTxtHandler()},
 		{"corsPreflight", corsPreflightHandler()},
 		{"getReports", getReportsHandler(pgDB)},

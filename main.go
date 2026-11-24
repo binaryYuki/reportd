@@ -1,10 +1,12 @@
 // Command reportd ingests browser security reports and Web Vitals,
-// persists them to SQL, and forwards them to BigQuery.
+// persists them to SQL, and optionally forwards them to BigQuery. The
+// dashboard is gated behind GitHub OAuth sign-in.
 package main
 
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -29,6 +31,7 @@ import (
 	"go.icco.me/gutil/logging"
 	"go.icco.me/gutil/tracing"
 	"go.icco.me/reportd/pkg/analytics"
+	"go.icco.me/reportd/pkg/auth"
 	"go.icco.me/reportd/pkg/db"
 	"go.icco.me/reportd/pkg/lib"
 	"go.icco.me/reportd/pkg/reporting"
@@ -97,6 +100,11 @@ func main() {
 	rTable := fs.String("reports_table", "", "The bigquery table to upload reports to.")
 	rv2Table := fs.String("reports_v2_table", "", "The bigquery table to upload reports to.")
 	databaseURL := fs.String("database_url", "", "Database connection string (e.g. postgres://user:pass@host/reportd or sqlite:///tmp/reportd.db).")
+	githubClientID := fs.String("github_client_id", "", "GitHub OAuth app client ID used for dashboard sign-in.")
+	githubClientSecret := fs.String("github_client_secret", "", "GitHub OAuth app client secret.")
+	allowedEmails := fs.String("allowed_emails", "", "Comma-separated allowlist of verified GitHub emails that may sign in.")
+	sessionSecret := fs.String("session_secret", "", "Secret (32+ chars) signing session cookies. Random per start when unset.")
+	maxStorageGB := fs.Float64("max_storage_gb", 5, "Storage cap in GB; the oldest rows are deleted beyond it. 0 disables the cap.")
 	if err := ff.Parse(fs, os.Args[1:], ff.WithEnvVarPrefix("REPORTD")); err != nil {
 		log.Fatalw("error parsing flags", zap.Error(err))
 	}
@@ -107,24 +115,29 @@ func main() {
 	}
 	log.Infow("Starting up", "host", fmt.Sprintf("http://localhost:%s", port))
 
-	if *project == "" {
-		log.Fatalw("project is required")
-	}
+	// BigQuery is optional: it is only used when a project is configured.
+	bigQuery := *project != ""
+	if bigQuery {
+		if *dataset == "" {
+			log.Fatalw("dataset is required when project is set")
+		}
 
-	if *dataset == "" {
-		log.Fatalw("dataset is required")
-	}
+		if *aTable == "" {
+			log.Fatalw("analytics_table is required when project is set")
+		}
 
-	if *aTable == "" {
-		log.Fatalw("analytics_table is required")
-	}
-
-	if *rTable == "" {
-		log.Fatalw("reports_table is required")
+		if *rTable == "" {
+			log.Fatalw("reports_table is required when project is set")
+		}
 	}
 
 	if *databaseURL == "" {
 		log.Fatalw("database_url is required")
+	}
+
+	authn, err := newAuthenticator(*githubClientID, *githubClientSecret, *allowedEmails, *sessionSecret)
+	if err != nil {
+		log.Fatalw("dashboard sign-in is not configured", zap.Error(err))
 	}
 
 	ctx := context.Background()
@@ -159,40 +172,61 @@ func main() {
 	}
 	log.Infow("Database connected and migrated")
 
-	if err := reportto.UpdateReportsBQSchema(ctx, *project, *dataset, *rTable); err != nil {
-		log.Errorw("report table update", zap.Error(err))
-	}
-
-	if err := analytics.UpdateAnalyticsBQSchema(ctx, *project, *dataset, *aTable); err != nil {
-		log.Errorw("analytics table update", zap.Error(err))
-	}
-
-	if err := reporting.UpdateReportsBQSchema(ctx, *project, *dataset, *rv2Table); err != nil {
-		log.Errorw("reporting table update", zap.Error(err))
-	}
-
-	writeReport := func(ctx context.Context, r *reportto.Report) {
-		if err := reportto.WriteReportToBigQuery(ctx, *project, *dataset, *rTable, []*reportto.Report{r}); err != nil {
-			log.Errorw("error during report upload to bigquery", "dataset", *dataset, "project", *project, "table", *rTable, zap.Error(err))
+	var (
+		writeReport         reportToBQWriter
+		writeAnalytics      analyticsBQWriter
+		writeSecurityReport securityReportBQWriter
+	)
+	if bigQuery {
+		if err := reportto.UpdateReportsBQSchema(ctx, *project, *dataset, *rTable); err != nil {
+			log.Errorw("report table update", zap.Error(err))
 		}
-	}
-	writeAnalytics := func(ctx context.Context, wv *analytics.WebVital) {
-		if err := analytics.WriteAnalyticsToBigQuery(ctx, *project, *dataset, *aTable, []*analytics.WebVital{wv}); err != nil {
-			log.Errorw("error during analytics upload to bigquery", "dataset", *dataset, "project", *project, "table", *aTable, zap.Error(err))
+
+		if err := analytics.UpdateAnalyticsBQSchema(ctx, *project, *dataset, *aTable); err != nil {
+			log.Errorw("analytics table update", zap.Error(err))
 		}
-	}
-	writeSecurityReport := func(ctx context.Context, sr *reporting.SecurityReport) {
-		if err := reporting.WriteReportsToBigQuery(ctx, *project, *dataset, *rv2Table, sr); err != nil {
-			log.Errorw("error during reporting upload to bigquery", "dataset", *dataset, "project", *project, "table", *rv2Table, zap.Error(err))
+
+		if err := reporting.UpdateReportsBQSchema(ctx, *project, *dataset, *rv2Table); err != nil {
+			log.Errorw("reporting table update", zap.Error(err))
 		}
+
+		writeReport = func(ctx context.Context, r *reportto.Report) {
+			if err := reportto.WriteReportToBigQuery(ctx, *project, *dataset, *rTable, []*reportto.Report{r}); err != nil {
+				log.Errorw("error during report upload to bigquery", "dataset", *dataset, "project", *project, "table", *rTable, zap.Error(err))
+			}
+		}
+		writeAnalytics = func(ctx context.Context, wv *analytics.WebVital) {
+			if err := analytics.WriteAnalyticsToBigQuery(ctx, *project, *dataset, *aTable, []*analytics.WebVital{wv}); err != nil {
+				log.Errorw("error during analytics upload to bigquery", "dataset", *dataset, "project", *project, "table", *aTable, zap.Error(err))
+			}
+		}
+		writeSecurityReport = func(ctx context.Context, sr *reporting.SecurityReport) {
+			if err := reporting.WriteReportsToBigQuery(ctx, *project, *dataset, *rv2Table, sr); err != nil {
+				log.Errorw("error during reporting upload to bigquery", "dataset", *dataset, "project", *project, "table", *rv2Table, zap.Error(err))
+			}
+		}
+	} else {
+		log.Infow("BigQuery disabled: no project configured")
 	}
 
-	r := newRouter(pgDB, writeReport, writeAnalytics, writeSecurityReport)
-	r.Method(http.MethodGet, "/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	pruneCtx, stopPrune := context.WithCancel(ctx)
+	defer stopPrune()
+	if *maxStorageGB > 0 {
+		maxBytes := int64(*maxStorageGB * (1 << 30))
+		log.Infow("Storage cap enabled", "max_bytes", maxBytes)
+		go enforceStorageLimitLoop(pruneCtx, pgDB, maxBytes, storageCheckInterval)
+	} else {
+		log.Warnw("Storage cap disabled: the database can grow without bound")
+	}
+
+	ingest := db.NewWriter(pgDB, db.WriterOptions{OnDrop: logDroppedRows})
+
+	r := newRouter(pgDB, ingest, writeReport, writeAnalytics, writeSecurityReport, authn)
+	r.Method(http.MethodGet, "/metrics", authn.RequireAPI(promhttp.HandlerFor(registry, promhttp.HandlerOpts{})))
 
 	handler := otelhttp.NewHandler(r, serverName,
 		otelhttp.WithFilter(func(req *http.Request) bool {
-			return req.URL.Path != "/metrics" && req.URL.Path != "/healthz"
+			return req.URL.Path != "/metrics" && req.URL.Path != statusPath
 		}),
 	)
 
@@ -222,15 +256,71 @@ func main() {
 	defer cancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Fatalw("Shutdown failed", zap.Error(err))
+		log.Errorw("Shutdown failed", zap.Error(err))
+	}
+
+	// After the server stops accepting requests, write what is still queued.
+	if err := ingest.Close(shutdownCtx); err != nil {
+		log.Errorw("ingest queue did not drain before shutdown", zap.Error(err))
 	}
 
 	log.Infow("Server stopped")
 }
 
+// storageCheckInterval is how often the storage cap is checked.
+const storageCheckInterval = 10 * time.Minute
+
+// newAuthenticator builds the dashboard authenticator from flag values. An
+// unset session secret gets a random one, which signs everyone out on restart.
+func newAuthenticator(clientID, clientSecret, allowedEmails, sessionSecret string) (*auth.Authenticator, error) {
+	secret := []byte(sessionSecret)
+	if len(secret) == 0 {
+		secret = make([]byte, 32)
+		if _, err := rand.Read(secret); err != nil {
+			return nil, fmt.Errorf("generating session secret: %w", err)
+		}
+		log.Warnw("session_secret is not set; sessions will not survive a restart")
+	}
+
+	return auth.New(auth.Config{
+		ClientID:      clientID,
+		ClientSecret:  clientSecret,
+		AllowedEmails: auth.ParseAllowedEmails(allowedEmails),
+		SessionSecret: secret,
+	})
+}
+
+// enforceStorageLimitLoop prunes the oldest rows whenever the database grows
+// past maxBytes, checking at startup and then every interval until ctx ends.
+func enforceStorageLimitLoop(ctx context.Context, d *gorm.DB, maxBytes int64, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		res, err := db.EnforceStorageLimit(ctx, d, maxBytes)
+		switch {
+		case ctx.Err() != nil:
+			return
+		case err != nil:
+			log.Errorw("enforcing storage cap", zap.Error(err), "max_bytes", maxBytes)
+		case res.RowsDeleted > 0:
+			log.Warnw("storage cap exceeded; pruned oldest rows", "max_bytes", maxBytes,
+				"bytes_before", res.BytesBefore, "bytes_after", res.BytesAfter, "rows_deleted", res.RowsDeleted)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 // newRouter builds the chi router shared by main() and the handler tests;
 // /metrics is mounted by main() because it owns the prometheus registry.
-func newRouter(pgDB *gorm.DB, writeReport reportToBQWriter, writeAnalytics analyticsBQWriter, writeSecurityReport securityReportBQWriter) *chi.Mux {
+// Ingested rows go through ingest so handlers never wait on the database.
+// A nil authn leaves the dashboard open, which only the tests rely on.
+func newRouter(pgDB *gorm.DB, ingest *db.Writer, writeReport reportToBQWriter, writeAnalytics analyticsBQWriter, writeSecurityReport securityReportBQWriter, authn *auth.Authenticator) *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(logging.Middleware(log.Desugar()))
 	r.Use(routeTag)
@@ -283,24 +373,33 @@ func newRouter(pgDB *gorm.DB, writeReport reportToBQWriter, writeAnalytics analy
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	r.Get("/", indexHandler(re, pgDB))
-	r.Get("/view/{service}", viewHandler(re))
-	r.Get("/healthz", healthzHandler())
+	// Dashboard pages and read APIs need a signed-in, allowlisted user. The
+	// ingestion POSTs below stay public: browsers send reports anonymously.
+	page := func(h http.Handler) http.Handler { return h }
+	api := page
+	if authn != nil {
+		authn.Routes(r)
+		page, api = authn.RequirePage, authn.RequireAPI
+	}
+
+	r.With(page).Get("/", indexHandler(re, pgDB))
+	r.With(page).Get("/view/{service}", viewHandler(re))
+	r.Get(statusPath, statusHandler(ingest))
 
 	r.Options("/report/{service}", corsPreflightHandler())
 	r.Options("/analytics/{service}", corsPreflightHandler())
 
-	r.Get("/reports/{service}", getReportsHandler(pgDB))
-	r.Post("/report/{service}", postReportHandler(pgDB, writeReport))
+	r.With(api).Get("/reports/{service}", getReportsHandler(pgDB))
+	r.Post("/report/{service}", postReportHandler(ingest, writeReport))
 
-	r.Get("/services", getServicesHandler(pgDB))
-	r.Get("/analytics/{service}", getAnalyticsHandler(pgDB))
-	r.Post("/analytics/{service}", postAnalyticsHandler(pgDB, writeAnalytics))
+	r.With(api).Get("/services", getServicesHandler(pgDB))
+	r.With(api).Get("/analytics/{service}", getAnalyticsHandler(pgDB))
+	r.Post("/analytics/{service}", postAnalyticsHandler(ingest, writeAnalytics))
 
-	r.Post("/reporting/{service}", postReportingHandler(pgDB, writeSecurityReport))
+	r.Post("/reporting/{service}", postReportingHandler(ingest, writeSecurityReport))
 
-	r.Get("/api/vitals/{service}", apiVitalsHandler(pgDB))
-	r.Get("/api/reports/{service}", apiReportsHandler(pgDB))
+	r.With(api).Get("/api/vitals/{service}", apiVitalsHandler(pgDB))
+	r.With(api).Get("/api/reports/{service}", apiReportsHandler(pgDB))
 
 	return r
 }
@@ -329,7 +428,9 @@ func indexHandler(re *render.Render, pgDB *gorm.DB) http.HandlerFunc {
 		if err := re.HTML(w, http.StatusOK, "index", struct {
 			Services   []string
 			HealthJSON string
+			User       string
 		}{
+			User:       auth.EmailFromContext(r.Context()),
 			Services:   services,
 			HealthJSON: string(healthJSON),
 		}); err != nil {
@@ -353,7 +454,9 @@ func viewHandler(re *render.Render) http.HandlerFunc {
 
 		if err := re.HTML(w, http.StatusOK, "view", struct {
 			Service string
+			User    string
 		}{
+			User:    auth.EmailFromContext(r.Context()),
 			Service: service,
 		}); err != nil {
 			l.Errorw("error rendering view", zap.Error(err), "service", service)
@@ -363,10 +466,28 @@ func viewHandler(re *render.Render) http.HandlerFunc {
 	}
 }
 
-func healthzHandler() http.HandlerFunc {
+// statusPath is the public health endpoint.
+const statusPath = "/api/status"
+
+// statusHandler reports whether ingested rows are reaching the database.
+// Writes are asynchronous, so this is where a failing write becomes visible:
+// while the most recent batch failed it answers 503 "orm: error <code>".
+// Only the code is exposed; the endpoint is public and the full error is in
+// the logs.
+func statusHandler(ingest *db.Writer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if _, err := w.Write([]byte("ok.")); err != nil {
-			logging.FromContext(r.Context()).Errorw("error writing healthz", zap.Error(err))
+		status, body := http.StatusOK, "ok."
+		if ingest != nil {
+			if err := ingest.LastError(); err != nil {
+				status, body = http.StatusServiceUnavailable, "orm: error "+db.ErrorCode(err)
+			}
+		}
+
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(status)
+		if _, err := w.Write([]byte(body)); err != nil {
+			logging.FromContext(r.Context()).Errorw("error writing status", zap.Error(err))
 		}
 	}
 }
@@ -425,11 +546,14 @@ func getReportsHandler(pgDB *gorm.DB) http.HandlerFunc {
 	}
 }
 
-// ingestContext detaches a request context so a write survives the client
-// hanging up. Beacons are sent on page unload, so the connection is routinely
-// torn down mid-insert.
-func ingestContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+// maxIngestBodyBytes caps a report upload. It bounds the memory one request
+// can pin, and with it the worst-case size of the ingest queue.
+const maxIngestBodyBytes = 1 << 20
+
+// logDroppedRows reports rows the ingest writer could not persist. Clients
+// were already answered, so the log is the only trace of the loss.
+func logDroppedRows(rows int, err error) {
+	log.Errorw("dropped ingested rows", "rows", rows, zap.Error(err))
 }
 
 // queryContext detaches a request context so a client hanging up does not
@@ -440,6 +564,12 @@ func queryContext(ctx context.Context) (context.Context, context.CancelFunc) {
 
 func handleBodyReadError(w http.ResponseWriter, r *http.Request, service string, err error) {
 	l := logging.FromContext(r.Context())
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		l.Warnw("request body too large", "service", service, "limit", tooLarge.Limit)
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
 	if errors.Is(err, io.ErrUnexpectedEOF) {
 		l.Warnw("incomplete request body", zap.Error(err), "service", service, "content-type", r.Header.Get("Content-Type"))
 		http.Error(w, "incomplete request body", http.StatusBadRequest)
@@ -449,7 +579,7 @@ func handleBodyReadError(w http.ResponseWriter, r *http.Request, service string,
 	http.Error(w, "uploading error", http.StatusInternalServerError)
 }
 
-func postReportHandler(pgDB *gorm.DB, writeBQ reportToBQWriter) http.HandlerFunc {
+func postReportHandler(ingest *db.Writer, writeBQ reportToBQWriter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		l := logging.FromContext(ctx)
@@ -462,7 +592,7 @@ func postReportHandler(pgDB *gorm.DB, writeBQ reportToBQWriter) http.HandlerFunc
 		}
 
 		buf := new(bytes.Buffer)
-		if _, err := buf.ReadFrom(r.Body); err != nil {
+		if _, err := buf.ReadFrom(http.MaxBytesReader(w, r.Body, maxIngestBodyBytes)); err != nil {
 			handleBodyReadError(w, r, service, err)
 			return
 		}
@@ -478,13 +608,8 @@ func postReportHandler(pgDB *gorm.DB, writeBQ reportToBQWriter) http.HandlerFunc
 
 		l.Infow("report received", "content-type", ct, "service", service, "user-agent", r.UserAgent(), "report", data)
 
-		entries := db.ReportToEntriesFromReport(data)
-		writeCtx, cancel := ingestContext(ctx)
-		defer cancel()
-		if err := pgDB.WithContext(writeCtx).Create(&entries).Error; err != nil {
-			l.Errorw("error writing report to postgres", zap.Error(err), "service", service)
-			http.Error(w, "storage error", 500)
-			return
+		for _, entry := range db.ReportToEntriesFromReport(data) {
+			ingest.Enqueue(entry)
 		}
 
 		w.WriteHeader(http.StatusNoContent)
@@ -538,7 +663,7 @@ func getAnalyticsHandler(pgDB *gorm.DB) http.HandlerFunc {
 	}
 }
 
-func postAnalyticsHandler(pgDB *gorm.DB, writeBQ analyticsBQWriter) http.HandlerFunc {
+func postAnalyticsHandler(ingest *db.Writer, writeBQ analyticsBQWriter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		l := logging.FromContext(ctx)
@@ -552,7 +677,7 @@ func postAnalyticsHandler(pgDB *gorm.DB, writeBQ analyticsBQWriter) http.Handler
 		}
 
 		buf := new(bytes.Buffer)
-		if _, err := buf.ReadFrom(r.Body); err != nil {
+		if _, err := buf.ReadFrom(http.MaxBytesReader(w, r.Body, maxIngestBodyBytes)); err != nil {
 			handleBodyReadError(w, r, service, err)
 			return
 		}
@@ -566,14 +691,7 @@ func postAnalyticsHandler(pgDB *gorm.DB, writeBQ analyticsBQWriter) http.Handler
 
 		l.Infow("analytics received", "content-type", ct, "service", service, "user-agent", r.UserAgent(), "analytics", data)
 
-		entry := db.WebVitalFromAnalytics(data)
-		writeCtx, cancel := ingestContext(ctx)
-		defer cancel()
-		if err := pgDB.WithContext(writeCtx).Create(entry).Error; err != nil {
-			l.Errorw("error writing analytics to postgres", zap.Error(err), "service", service)
-			http.Error(w, "storage error", 500)
-			return
-		}
+		ingest.Enqueue(db.WebVitalFromAnalytics(data))
 
 		w.WriteHeader(http.StatusNoContent)
 
@@ -583,7 +701,7 @@ func postAnalyticsHandler(pgDB *gorm.DB, writeBQ analyticsBQWriter) http.Handler
 	}
 }
 
-func postReportingHandler(pgDB *gorm.DB, writeBQ securityReportBQWriter) http.HandlerFunc {
+func postReportingHandler(ingest *db.Writer, writeBQ securityReportBQWriter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		l := logging.FromContext(ctx)
@@ -608,7 +726,7 @@ func postReportingHandler(pgDB *gorm.DB, writeBQ securityReportBQWriter) http.Ha
 		}
 
 		buf := new(bytes.Buffer)
-		if _, err := buf.ReadFrom(r.Body); err != nil {
+		if _, err := buf.ReadFrom(http.MaxBytesReader(w, r.Body, maxIngestBodyBytes)); err != nil {
 			handleBodyReadError(w, r, service, err)
 			return
 		}
@@ -629,14 +747,7 @@ func postReportingHandler(pgDB *gorm.DB, writeBQ securityReportBQWriter) http.Ha
 
 		l.Infow("reporting parsed", "reports", reports, "service", service, "content-type", contentType, "user-agent", r.UserAgent())
 
-		entry := db.SecurityReportEntryFromReport(reports)
-		writeCtx, cancel := ingestContext(ctx)
-		defer cancel()
-		if err := pgDB.WithContext(writeCtx).Create(entry).Error; err != nil {
-			l.Errorw("error writing reporting to postgres", zap.Error(err), "service", service)
-			http.Error(w, "storage error", 500)
-			return
-		}
+		ingest.Enqueue(db.SecurityReportEntryFromReport(reports))
 
 		w.WriteHeader(http.StatusNoContent)
 
