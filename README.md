@@ -201,6 +201,12 @@ The MySQL integration test runs when `TEST_MYSQL_URL` is set:
 TEST_MYSQL_URL=mysql://root:reportd@localhost:3306/reportd go test ./pkg/db/
 ```
 
+## Syncing with upstream
+
+`.github/workflows/sync-upstream.yml` merges [icco/reportd](https://github.com/icco/reportd) `main` into this repository's `main` every day (and on demand from the Actions tab). The merge is built and tested before it is pushed. When upstream conflicts with local changes, or the merged code fails its tests, the run fails and nothing is pushed; merge by hand in that case.
+
+Add a `SYNC_TOKEN` repository secret holding a personal access token with the `repo` and `workflow` scopes. Without it the workflow falls back to the default token, which GitHub does not allow to push commits that change files under `.github/workflows`, so any upstream update that touches a workflow would fail to sync.
+
 ## Integrating with your site
 
 ### Web Vitals

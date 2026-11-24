@@ -1,0 +1,64 @@
+name: Sync upstream
+on:
+  schedule:
+    # Daily at 03:17 UTC; off the hour, when scheduled runs are least delayed.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+env:
+  UPSTREAM_REPO: icco/reportd
+  UPSTREAM_BRANCH: main
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # Upstream itself has nothing to pull from.
+    if: github.repository != 'icco/reportd'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          # The default GITHUB_TOKEN may not push commits that touch
+          # .github/workflows, and its pushes do not trigger other workflows.
+          # Set a SYNC_TOKEN secret (a PAT with repo + workflow scope) to lift
+          # both limits.
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+      - name: Merge upstream
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "${UPSTREAM_BRANCH}"
+
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
+            echo "Already up to date with ${UPSTREAM_REPO}."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git merge --no-edit -m "chore: merge upstream ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}" "upstream/${UPSTREAM_BRANCH}"; then
+            echo "::error::Upstream changes conflict with this repository. Merge ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} by hand."
+            git diff --name-only --diff-filter=U
+            git merge --abort
+            exit 1
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+      - name: Setup Go
+        if: steps.merge.outputs.changed == 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # A merge can apply cleanly and still break the build; never push that.
+      - name: Test the merge
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          go build ./...
+          go test ./...
+      - name: Push
+        if: steps.merge.outputs.changed == 'true'
+        run: git push origin HEAD:main
