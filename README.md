@@ -127,49 +127,27 @@ docker run -p 8080:8080 \
 
 ### Docker Compose (self-hosting)
 
-[`compose.yaml`](compose.yaml) is a ready-to-use example for running reportd against an external database such as MySQL HeatWave: it reads its settings from a `.env` file and applies limits for a 0.1 vCPU / 512 MB instance.
+[`compose.yaml`](compose.yaml) runs the full stack: reportd, its own MySQL database on a named volume, and an optional HTTPS reverse proxy.
 
-The example below instead runs reportd with its own MySQL database in a single `docker compose up -d`.
-
-Save this as `docker-compose.yml`:
-
-```yaml
-services:
-  reportd:
-    image: akkk1234/reportd:latest
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
-    environment:
-      REPORTD_DATABASE_URL: mysql://reportd:reportd@db:3306/reportd
-      REPORTD_GITHUB_CLIENT_ID: your-client-id
-      REPORTD_GITHUB_CLIENT_SECRET: your-client-secret
-      REPORTD_ALLOWED_EMAILS: you@example.com
-      REPORTD_SESSION_SECRET: a-long-random-string-of-32-or-more-chars
-    depends_on:
-      db:
-        condition: service_healthy
-
-  db:
-    image: mysql:8.4
-    restart: unless-stopped
-    environment:
-      MYSQL_USER: reportd
-      MYSQL_PASSWORD: reportd
-      MYSQL_DATABASE: reportd
-      MYSQL_RANDOM_ROOT_PASSWORD: "yes"
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-ureportd", "-preportd"]
-      interval: 5s
-      retries: 20
-    volumes:
-      - reportd-mysql:/var/lib/mysql
-
-volumes:
-  reportd-mysql:
+```bash
+cp .env.example .env    # then fill it in
+docker compose up -d
 ```
 
-reportd will be reachable at `http://localhost:8080`. Put it behind a reverse proxy (Caddy, nginx, Traefik) to expose it on a public hostname over HTTPS — browser reporting endpoints must be HTTPS. The proxy must send `X-Forwarded-Proto: https` so session cookies are marked `Secure`.
+reportd is then reachable at `http://localhost:8080`. Browser reporting endpoints must be HTTPS, so for a public deployment start the bundled Caddy proxy as well. Set `REPORTD_DOMAIN` in `.env`, point the domain's DNS at the host, open ports 80 and 443, and run:
+
+```bash
+docker compose --profile https up -d
+```
+
+Caddy obtains and renews a Let's Encrypt certificate on its own. If you use a different proxy, it must send `X-Forwarded-Proto: https` so session cookies are marked `Secure`.
+
+| Volume | Holds |
+|--------|-------|
+| `db-data` | The MySQL database. Back it up; `docker compose down -v` deletes it and every report with it |
+| `caddy-data`, `caddy-config` | TLS certificates and proxy state |
+
+The bundled MySQL is tuned for a small host (binary logs off, 128 MB buffer pool) and uses roughly 300 MB of memory on its own. To use an external database such as MySQL HeatWave instead, follow the note at the top of `compose.yaml`.
 
 Other databases use the same variable: `postgresql://reportd:reportd@db:5432/reportd?sslmode=disable` for Postgres, or `sqlite:///data/reportd.db` with a volume mounted at `/data` for SQLite.
 
