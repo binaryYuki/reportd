@@ -20,8 +20,8 @@ cloud.google.com/go/monitoring v1.30.0 h1:r/d+JUbyKmJ8b07iznuKfzVzrIXTWxHQ3lBRm3
 cloud.google.com/go/monitoring v1.30.0/go.mod h1:htlUR0QWVMrjFzZmN4LGnMAve9xB/eduwjmINxVZ8RM=
 cloud.google.com/go/storage v1.62.3 h1:SZq1t23NCI+e96dH77Dg3PEfsNNEjqO8zE5AnD8gVD0=
 cloud.google.com/go/storage v1.62.3/go.mod h1:cpYz/kRVZ+UQAF1uHeea10/9ewcRbxGoGNKsS9daSXA=
-filippo.io/edwards25519 v1.1.0 h1:FNf4tywRC1HmFuKW5xopWpigGjJKiJSV0Cqo0cJWDaA=
-filippo.io/edwards25519 v1.1.0/go.mod h1:BxyFTGdWcka3PhytdK4V28tE5sGfRvvvRV7EaN4VDT4=
+filippo.io/edwards25519 v1.1.1 h1:YpjwWWlNmGIDyXOn8zLzqiD+9TyIlPhGFG96P39uBpw=
+filippo.io/edwards25519 v1.1.1/go.mod h1:BxyFTGdWcka3PhytdK4V28tE5sGfRvvvRV7EaN4VDT4=
 github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.35.0 h1:bN1gA3of5bXtbnLsRPrwfmbbe7A5UWFlcTHseujLnpc=
 github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.35.0/go.mod h1:Yj5vHEz/aAepZGliRJsA6uvHAVAQyEwajq9ORCHPxzM=
 github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric v0.55.0 h1:UnDZ/zFfG1JhH/DqxIZYU/1CUAlTUScoXD/LcM2Ykk8=
