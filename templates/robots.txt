@@ -1,5 +1,8 @@
 User-agent: *
 Disallow: /api/
+Disallow: /auth/
+Disallow: /view/
+Disallow: /projects
 Disallow: /services
 Disallow: /reports/
 Disallow: /analytics/

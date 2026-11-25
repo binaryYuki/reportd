@@ -124,7 +124,7 @@ func TestIngestTruncatedBodies(t *testing.T) {
 	core, logs := observer.New(zap.WarnLevel)
 	log = zap.New(core).Sugar()
 	t.Cleanup(func() { log = previousLog })
-	h := newRouter(nil, nil, nil, nil, nil, nil)
+	h := newRouter(nil, nil, nil, nil, nil, nil, nil)
 
 	for _, tc := range []struct {
 		target      string

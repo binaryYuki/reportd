@@ -1,219 +1,110 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 
   <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ReportD</title>
-    <script src="https://cdn.tailwindcss.com?plugins=forms,typography,aspect-ratio,container-queries"></script>
-
-    <style>
-      body { max-width: 1200px; }
-    </style>
-
-    <script type="module">
-      import { onCLS, onINP, onLCP, onFCP, onTTFB } from 'https://unpkg.com/web-vitals@5?module';
-
-      function sendToAnalytics(metric) {
-        const body = JSON.stringify(metric);
-        (navigator.sendBeacon && navigator.sendBeacon('https://reportd.natwelch.com/analytics/resume', body)) ||
-          fetch('https://reportd.natwelch.com/analytics/resume', { body, method: 'POST', keepalive: true });
-      }
-
-      onCLS(sendToAnalytics);
-      onFCP(sendToAnalytics);
-      onINP(sendToAnalytics);
-      onLCP(sendToAnalytics);
-      onTTFB(sendToAnalytics);
-    </script>
+{{ template "head" . }}
   </head>
 
-  <body class="mx-auto p-6 md:p-24 bg-black text-white">
+  <body class="bg-zinc-950 text-zinc-100 antialiased">
+    <div class="mx-auto max-w-5xl px-5 py-10 sm:py-16">
 
-    <header class="mb-10">
-      <h1 class="text-3xl font-bold">ReportD</h1>
-      <p class="text-gray-500">
-        Browser reporting and Web Vitals dashboard.
-        <a class="underline" href="https://github.com/icco/reportd">Source on GitHub</a>.
-      </p>
-      {{if .User}}
-      <form method="post" action="/auth/logout" class="mt-2 text-sm text-gray-500">
-        Signed in as {{ .User }}.
-        <button type="submit" class="underline hover:text-white">Sign out</button>
-      </form>
-      {{end}}
-    </header>
+      <header class="mb-12">
+        <div class="flex items-center justify-between gap-4">
+          <h1 class="text-2xl font-bold tracking-tight">ReportD</h1>
+{{ template "topbar" . }}
+        </div>
 
-    <main>
+        <p id="stats" class="mt-4 text-xl font-bold"
+           aria-label="{{if .HasSince}}自上次登录以来{{else}}全部数据{{end}}：共 {{ .Counts.Total }} 条，性能指标 {{ .Counts.Vitals }} 条，浏览器报告 {{ .Counts.Reports }} 条">
+          <span {{if .HasSince}}title="上次登录：{{ .Since }}"{{end}}>{{if .HasSince}}自上次登录以来{{else}}全部数据{{end}}：</span>
+          <span class="text-blue-500" title="总数">{{ .Counts.Total }}</span>
+          <span class="text-zinc-600">|</span>
+          <span class="text-green-500" title="性能指标（Web Vitals）">{{ .Counts.Vitals }}</span>
+          <span class="text-zinc-600">|</span>
+          <span class="text-red-500" title="浏览器报告（CSP 违规、崩溃等）">{{ .Counts.Reports }}</span>
+        </p>
+        <p class="mt-1 text-sm text-zinc-500">
+          <span class="text-blue-500">总数</span> ·
+          <span class="text-green-500">性能指标</span> ·
+          <span class="text-red-500">浏览器报告</span>
+        </p>
+      </header>
 
-      {{if .Services}}
-      <div class="border-b border-gray-700 pb-2 mb-6">
-        <h2 class="text-xl font-medium">Services</h2>
-      </div>
-      <div id="services" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-16">
-        {{range $element := .Services}}
-        <a href="/view/{{ $element }}" class="block rounded-lg border border-gray-700 p-4 hover:border-gray-500 transition-colors" data-service="{{ $element }}">
-          <div class="flex items-center justify-between mb-2">
-            <h2 class="text-lg font-medium">{{ $element }}</h2>
-            <span class="text-gray-500 text-sm">&rarr;</span>
-          </div>
-          <div class="flex gap-2 flex-wrap" id="health-{{ $element }}">
-          </div>
-        </a>
+      <main>
+        <div class="mb-4 flex items-baseline justify-between">
+          <h2 class="text-lg font-semibold">项目</h2>
+          <span class="text-sm text-zinc-500">{{ len .Services }} 个</span>
+        </div>
+
+        {{if eq .Error "name"}}
+        <p role="alert" class="mb-4 rounded-md bg-red-950 px-3 py-2 text-sm text-red-300 ring-1 ring-red-900">
+          项目名只能包含字母、数字、“-” 和 “_”，最长 32 个字符。
+        </p>
+        {{else if .Error}}
+        <p role="alert" class="mb-4 rounded-md bg-red-950 px-3 py-2 text-sm text-red-300 ring-1 ring-red-900">
+          操作没有成功，请稍后再试。
+        </p>
         {{end}}
-      </div>
-      {{end}}
 
-      <div class="border-b border-gray-700 pb-2 mb-6">
-        <h2 class="text-xl font-medium">Self-host</h2>
-        <p class="text-gray-500 text-sm">reportd runs from a single Docker image alongside Postgres (or SQLite) &mdash; see the <a class="underline" href="https://github.com/icco/reportd#docker-compose-self-hosting" target="_blank">docker compose instructions in the README</a> for a working <code class="text-gray-300">docker-compose.yml</code> and the BigQuery setup it needs.</p>
-      </div>
+        {{if .Services}}
+        <ul id="projects" class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {{range $name := .Services}}
+          <li>
+            <a href="/view/{{ $name }}" data-project="{{ $name }}"
+               class="group block rounded-lg bg-zinc-900 p-4 ring-1 ring-zinc-800 transition hover:ring-zinc-600">
+              <div class="flex items-center justify-between">
+                <span class="truncate font-medium">{{ $name }}</span>
+                <span aria-hidden="true" class="text-zinc-600 transition group-hover:translate-x-0.5 group-hover:text-zinc-300">&rarr;</span>
+              </div>
+              <div class="mt-3 flex min-h-6 flex-wrap gap-1.5" data-health></div>
+            </a>
+          </li>
+          {{end}}
+        </ul>
+        {{else}}
+        <p class="rounded-lg bg-zinc-900 p-6 text-sm text-zinc-400 ring-1 ring-zinc-800">
+          还没有项目。{{if .CanManage}}在下面新建一个，然后按项目页里的接入方法把上报地址配到你的网站上。{{end}}
+        </p>
+        {{end}}
 
-      <div class="border-b border-gray-700 pb-2 mb-6">
-        <h2 class="text-xl font-medium">Setup</h2>
-        <p class="text-gray-500 text-sm">Add these snippets to your site to start sending data. Replace <code class="text-gray-300">YOURSITE</code> with a short name for your service.</p>
-      </div>
-
-      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-16">
-
-        <div class="rounded-lg border border-gray-700 p-5">
-          <h3 class="text-sm font-medium text-gray-400 mb-1">Web Vitals</h3>
-          <p class="text-xs text-gray-500 mb-3">Tracks LCP, CLS, INP, FCP, and TTFB using the <a class="underline" href="https://github.com/GoogleChrome/web-vitals" target="_blank">web-vitals</a> library.</p>
-          <pre class="bg-gray-900 rounded p-3 text-xs text-gray-300 overflow-x-auto whitespace-pre"><code>&lt;script type="module"&gt;
-  import { onCLS, onINP, onLCP, onFCP, onTTFB }
-    from 'https://unpkg.com/web-vitals@5?module';
-
-  function send(metric) {
-    const body = JSON.stringify(metric);
-    navigator.sendBeacon(
-      '/analytics/<span class="text-amber-400">YOURSITE</span>', body
-    ) || fetch('/analytics/<span class="text-amber-400">YOURSITE</span>', {
-      body, method: 'POST', keepalive: true
-    });
-  }
-
-  onCLS(send);
-  onFCP(send);
-  onINP(send);
-  onLCP(send);
-  onTTFB(send);
-&lt;/script&gt;</code></pre>
-        </div>
-
-        <div class="rounded-lg border border-gray-700 p-5">
-          <h3 class="text-sm font-medium text-gray-400 mb-1">Browser Reports</h3>
-          <p class="text-xs text-gray-500 mb-3">Receives CSP violations, deprecation warnings, interventions, crashes, COOP, COEP, and permissions policy violations.</p>
-          <pre class="bg-gray-900 rounded p-3 text-xs text-gray-300 overflow-x-auto whitespace-pre"><code><span class="text-gray-500"># Reporting API v1 (modern browsers)</span>
-Reporting-Endpoints: default="/reporting/<span class="text-amber-400">YOURSITE</span>"
-
-<span class="text-gray-500"># CSP with reporting</span>
-Content-Security-Policy:
-  default-src 'self'; report-to default;
-
-<span class="text-gray-500"># COOP / COEP</span>
-Cross-Origin-Opener-Policy:
-  same-origin; report-to="default"
-Cross-Origin-Embedder-Policy:
-  require-corp; report-to="default"
-
-<span class="text-gray-500"># Legacy Report-To (older browsers)</span>
-Report-To: {"group":"default",
-  "max_age":10886400,
-  "endpoints":[{"url":"/report/<span class="text-amber-400">YOURSITE</span>"}]}</code></pre>
-        </div>
-
-      </div>
-
-      <div class="border-b border-gray-700 pb-2 mb-6">
-        <h2 class="text-xl font-medium">API Endpoints</h2>
-      </div>
-
-      <div class="mb-16 overflow-x-auto">
-        <table class="w-full text-sm text-left">
-          <thead class="text-xs text-gray-400 uppercase border-b border-gray-700">
-            <tr>
-              <th class="py-2 pr-4">Method</th>
-              <th class="py-2 pr-4">Endpoint</th>
-              <th class="py-2 pr-4">Description</th>
-            </tr>
-          </thead>
-          <tbody class="text-gray-300">
-            <tr class="border-b border-gray-800">
-              <td class="py-2 pr-4"><span class="text-xs px-1.5 py-0.5 rounded bg-green-900/50 text-green-400">POST</span></td>
-              <td class="py-2 pr-4 font-mono text-xs">/analytics/{service}</td>
-              <td class="py-2 pr-4 text-gray-500">Send Web Vitals data</td>
-            </tr>
-            <tr class="border-b border-gray-800">
-              <td class="py-2 pr-4"><span class="text-xs px-1.5 py-0.5 rounded bg-green-900/50 text-green-400">POST</span></td>
-              <td class="py-2 pr-4 font-mono text-xs">/reporting/{service}</td>
-              <td class="py-2 pr-4 text-gray-500">Reporting API v1 endpoint</td>
-            </tr>
-            <tr class="border-b border-gray-800">
-              <td class="py-2 pr-4"><span class="text-xs px-1.5 py-0.5 rounded bg-green-900/50 text-green-400">POST</span></td>
-              <td class="py-2 pr-4 font-mono text-xs">/report/{service}</td>
-              <td class="py-2 pr-4 text-gray-500">Legacy Report-To endpoint</td>
-            </tr>
-            <tr class="border-b border-gray-800">
-              <td class="py-2 pr-4"><span class="text-xs px-1.5 py-0.5 rounded bg-blue-900/50 text-blue-400">GET</span></td>
-              <td class="py-2 pr-4 font-mono text-xs">/view/{service}</td>
-              <td class="py-2 pr-4 text-gray-500">Dashboard for a service</td>
-            </tr>
-            <tr class="border-b border-gray-800">
-              <td class="py-2 pr-4"><span class="text-xs px-1.5 py-0.5 rounded bg-blue-900/50 text-blue-400">GET</span></td>
-              <td class="py-2 pr-4 font-mono text-xs">/api/vitals/{service}</td>
-              <td class="py-2 pr-4 text-gray-500">JSON: average summaries + daily time series</td>
-            </tr>
-            <tr class="border-b border-gray-800">
-              <td class="py-2 pr-4"><span class="text-xs px-1.5 py-0.5 rounded bg-blue-900/50 text-blue-400">GET</span></td>
-              <td class="py-2 pr-4 font-mono text-xs">/api/reports/{service}</td>
-              <td class="py-2 pr-4 text-gray-500">JSON: report counts + recent violations</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-
-    </main>
+        {{if .CanManage}}
+        <form method="post" action="/projects" class="mt-6 flex flex-wrap items-end gap-3">
+          <label class="grow sm:max-w-xs">
+            <span class="mb-1 block text-sm text-zinc-400">新建项目</span>
+            <input name="name" required maxlength="32" pattern="[A-Za-z0-9_\-]+" autocomplete="off" spellcheck="false"
+                   placeholder="例如 blog"
+                   class="w-full rounded-md bg-zinc-900 px-3 py-2 text-sm text-zinc-100 ring-1 ring-zinc-700 placeholder:text-zinc-600 focus:ring-blue-500">
+          </label>
+          <button type="submit" class="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500">创建</button>
+        </form>
+        <p class="mt-2 text-xs text-zinc-500">只有已创建的项目才接收上报；名字会出现在上报地址里。</p>
+        {{end}}
+      </main>
+    </div>
 
     <script>
-      const THRESHOLDS = {
-        LCP:  { good: 2500, poor: 4000 },
-        CLS:  { good: 0.1,  poor: 0.25 },
-        INP:  { good: 200,  poor: 500 },
-        FCP:  { good: 1800, poor: 3000 },
-        TTFB: { good: 800,  poor: 1800 },
-      };
-
-      const CWV_METRICS = ['LCP', 'CLS', 'INP'];
-
-      function ratingInfo(metric, value) {
-        const t = THRESHOLDS[metric];
-        if (!t) return { cls: 'bg-gray-800 text-gray-400', label: metric };
-        if (value <= t.good) return { cls: 'bg-green-900/50 text-green-400', label: metric };
-        if (value <= t.poor) return { cls: 'bg-amber-900/50 text-amber-400', label: metric };
-        return { cls: 'bg-red-900/50 text-red-400', label: metric };
-      }
-
+      // 28-day averages per project, as rated chips for the three Core Web Vitals.
       try {
         const health = JSON.parse({{ .HealthJSON }});
-        Object.entries(health).forEach(([service, metrics]) => {
-          const container = document.getElementById('health-' + service);
-          if (!container) return;
-
-          const cwvMetrics = metrics.filter(m => CWV_METRICS.includes(m.metric));
-          if (!cwvMetrics.length) {
-            container.innerHTML = '<span class="text-xs text-gray-600">No vitals data</span>';
+        document.querySelectorAll('[data-project]').forEach((card) => {
+          const box = card.querySelector('[data-health]');
+          const metrics = (health[card.dataset.project] || []).filter((m) => ['LCP', 'INP', 'CLS'].includes(m.metric));
+          if (!metrics.length) {
+            box.append(el('span', { class: 'text-xs text-zinc-600' }, '暂无性能数据'));
             return;
           }
-
-          container.innerHTML = cwvMetrics.map(m => {
-            const r = ratingInfo(m.metric, m.average);
-            return `<span class="text-xs px-1.5 py-0.5 rounded ${r.cls}">${m.metric}</span>`;
-          }).join('');
+          for (const m of metrics) {
+            const r = rate(m.metric, m.average);
+            box.append(el('span', {
+              class: 'rounded px-1.5 py-0.5 text-xs ring-1 ' + r.chip,
+              title: VITALS[m.metric].label + '：' + formatVital(m.metric, m.average) + '（' + r.text + '）',
+            }, m.metric + ' ' + formatVital(m.metric, m.average)));
+          }
         });
-      } catch(e) {
-        console.error('Error parsing health data:', e);
+      } catch (e) {
+        console.error('rendering project health', e);
       }
     </script>
   </body>
-
 </html>

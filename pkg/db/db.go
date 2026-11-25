@@ -127,6 +127,8 @@ func AutoMigrate(ctx context.Context, db *gorm.DB) error {
 		&WebVital{},
 		&ReportToEntry{},
 		&SecurityReportEntry{},
+		&UserLogin{},
+		&Project{},
 	); err != nil {
 		return fmt.Errorf("auto-migrating: %w", err)
 	}

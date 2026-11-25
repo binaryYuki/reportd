@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html/template"
 	"io"
 	"net/http"
 	"net/url"
@@ -32,8 +33,9 @@ const (
 	stateTTL      = 10 * time.Minute
 	maxBodyBytes  = 1 << 20
 
-	// LoginPath starts the OAuth flow; CallbackPath is the path to register
-	// as the GitHub OAuth app's authorization callback.
+	// LoginPath shows the sign-in page (GET) and starts the OAuth flow
+	// (POST); CallbackPath is the path to register as the GitHub OAuth app's
+	// authorization callback.
 	LoginPath    = "/auth/login"
 	CallbackPath = "/auth/callback"
 	LogoutPath   = "/auth/logout"
@@ -52,6 +54,11 @@ type Config struct {
 	// SessionSecret signs session cookies; at least 32 bytes.
 	SessionSecret []byte
 
+	// OnLogin, when set, is told about each successful sign-in and returns
+	// the time of that user's previous one (zero if none). The result is
+	// kept in the session; see SinceFromContext.
+	OnLogin func(ctx context.Context, email string, at time.Time) (time.Time, error)
+
 	// The fields below default to GitHub and the real clock; tests override.
 	AuthURL    string
 	TokenURL   string
@@ -62,11 +69,57 @@ type Config struct {
 
 // Authenticator runs the OAuth flow and guards handlers.
 type Authenticator struct {
-	cfg     Config
-	allowed map[string]bool
+	cfg       Config
+	allowed   map[string]bool
+	loginPage LoginPage
+}
+
+// Sign-in failures, as LoginData.Error codes.
+const (
+	ErrorDenied    = "denied"    // no allowlisted verified email
+	ErrorState     = "state"     // missing or mismatched OAuth state
+	ErrorCancelled = "cancelled" // GitHub returned no code
+	ErrorFailed    = "failed"    // GitHub could not be reached or refused
+)
+
+// LoginData is what a sign-in page needs to render.
+type LoginData struct {
+	// Next is the local path to return to after signing in.
+	Next string
+	// Error is "" or one of the Error* codes.
+	Error string
+	// Status is the HTTP status the page must be sent with.
+	Status int
+}
+
+// LoginPage renders the sign-in page: a form that POSTs "next" to LoginPath.
+type LoginPage func(w http.ResponseWriter, r *http.Request, data LoginData)
+
+// defaultLoginPage is the plain page used when Routes is given none.
+var defaultLoginPage = template.Must(template.New("login").Parse(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="robots" content="noindex"><title>Sign in</title></head>
+<body>
+{{if .Error}}<p role="alert">Sign-in failed ({{.Error}}).</p>{{end}}
+<form method="post" action="` + LoginPath + `">
+<input type="hidden" name="next" value="{{.Next}}">
+<button type="submit">Sign in with GitHub</button>
+</form>
+</body></html>`))
+
+func renderDefaultLoginPage(w http.ResponseWriter, _ *http.Request, data LoginData) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(data.Status)
+	_ = defaultLoginPage.Execute(w, data)
 }
 
 type ctxKey struct{}
+
+// session is what a valid session cookie carries.
+type session struct {
+	email string
+	// since is the user's previous sign-in; zero when unknown.
+	since time.Time
+}
 
 // ParseAllowedEmails splits a comma- or whitespace-separated allowlist.
 func ParseAllowedEmails(s string) []string {
@@ -120,13 +173,28 @@ func normalize(email string) string {
 // EmailFromContext returns the signed-in email set by the Require
 // middlewares, or "".
 func EmailFromContext(ctx context.Context) string {
-	email, _ := ctx.Value(ctxKey{}).(string)
-	return email
+	s, _ := ctx.Value(ctxKey{}).(session)
+	return s.email
 }
 
-// Routes mounts the login, callback, and logout handlers.
-func (a *Authenticator) Routes(r chi.Router) {
-	r.Get(LoginPath, a.handleLogin)
+// SinceFromContext returns when the signed-in user had last signed in before
+// this session, or the zero time when that is unknown (first sign-in, or no
+// OnLogin hook).
+func SinceFromContext(ctx context.Context) time.Time {
+	s, _ := ctx.Value(ctxKey{}).(session)
+	return s.since
+}
+
+// Routes mounts the sign-in page, login, callback, and logout handlers. A nil
+// page uses a plain built-in one.
+func (a *Authenticator) Routes(r chi.Router, page LoginPage) {
+	if page == nil {
+		page = renderDefaultLoginPage
+	}
+	a.loginPage = page
+
+	r.Get(LoginPath, a.handleLoginPage)
+	r.Post(LoginPath, a.handleLogin)
 	r.Get(CallbackPath, a.handleCallback)
 	r.Post(LogoutPath, a.handleLogout)
 }
@@ -152,38 +220,46 @@ func (a *Authenticator) require(next http.Handler, deny http.HandlerFunc) http.H
 		// Dashboard data is per-login; keep it out of shared caches.
 		w.Header().Set("Cache-Control", "private, no-store")
 
-		email := a.sessionEmail(r)
-		if email == "" {
+		s, ok := a.session(r)
+		if !ok {
 			deny(w, r)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, email)))
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, s)))
 	})
 }
 
-// sessionEmail returns the email of a valid, unexpired session whose address
-// is still on the allowlist, or "".
-func (a *Authenticator) sessionEmail(r *http.Request) string {
+// session returns the request's session when its cookie is valid, unexpired,
+// and for an address still on the allowlist. The payload is
+// "email|expiry|since", all times in Unix seconds; since is optional.
+func (a *Authenticator) session(r *http.Request) (session, bool) {
 	c, err := r.Cookie(sessionCookie)
 	if err != nil {
-		return ""
+		return session{}, false
 	}
 	payload, ok := a.verify(c.Value)
 	if !ok {
-		return ""
+		return session{}, false
 	}
-	email, expiry, ok := strings.Cut(payload, "|")
-	if !ok {
-		return ""
+	fields := strings.Split(payload, "|")
+	if len(fields) < 2 {
+		return session{}, false
 	}
-	exp, err := strconv.ParseInt(expiry, 10, 64)
+	exp, err := strconv.ParseInt(fields[1], 10, 64)
 	if err != nil || a.cfg.Now().Unix() >= exp {
-		return ""
+		return session{}, false
 	}
-	if !a.allowed[email] {
-		return ""
+	if !a.allowed[fields[0]] {
+		return session{}, false
 	}
-	return email
+
+	s := session{email: fields[0]}
+	if len(fields) > 2 {
+		if since, err := strconv.ParseInt(fields[2], 10, 64); err == nil && since > 0 {
+			s.since = time.Unix(since, 0)
+		}
+	}
+	return s, true
 }
 
 func (a *Authenticator) sign(payload string) string {
@@ -249,10 +325,32 @@ func (a *Authenticator) setCookie(w http.ResponseWriter, r *http.Request, name, 
 	http.SetCookie(w, c)
 }
 
-func (a *Authenticator) handleLogin(w http.ResponseWriter, r *http.Request) {
+// showLogin renders the sign-in page. It must never be cached or indexed:
+// it reflects the visitor's own sign-in attempt.
+func (a *Authenticator) showLogin(w http.ResponseWriter, r *http.Request, data LoginData) {
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("X-Robots-Tag", "noindex")
+	a.loginPage(w, r, data)
+}
+
+// handleLoginPage shows the sign-in page. It deliberately does not redirect
+// to GitHub by itself: crawlers and stray visits would otherwise send GitHub
+// a steady stream of automated authorization requests from this site. The
+// flow starts only when a person presses the button (handleLogin).
+func (a *Authenticator) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 	next := safeNext(r.URL.Query().Get("next"))
-	if a.sessionEmail(r) != "" {
+	if _, ok := a.session(r); ok {
 		http.Redirect(w, r, next, http.StatusFound)
+		return
+	}
+	a.showLogin(w, r, LoginData{Next: next, Status: http.StatusOK})
+}
+
+func (a *Authenticator) handleLogin(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+	next := safeNext(r.PostFormValue("next"))
+	if _, ok := a.session(r); ok {
+		http.Redirect(w, r, next, http.StatusSeeOther)
 		return
 	}
 
@@ -271,7 +369,7 @@ func (a *Authenticator) handleLogin(w http.ResponseWriter, r *http.Request) {
 		"scope":     {"user:email"},
 		"state":     {state},
 	}
-	http.Redirect(w, r, a.cfg.AuthURL+"?"+q.Encode(), http.StatusFound)
+	http.Redirect(w, r, a.cfg.AuthURL+"?"+q.Encode(), http.StatusSeeOther)
 }
 
 func (a *Authenticator) handleCallback(w http.ResponseWriter, r *http.Request) {
@@ -286,22 +384,28 @@ func (a *Authenticator) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	a.setCookie(w, r, stateCookie, "", 0)
 
+	next = safeNext(next)
+	// Failures land back on the sign-in page, where the user can retry.
+	fail := func(code string, status int) {
+		a.showLogin(w, r, LoginData{Next: next, Error: code, Status: status})
+	}
+
 	got := r.URL.Query().Get("state")
 	if state == "" || subtle.ConstantTimeCompare([]byte(state), []byte(got)) != 1 {
-		http.Error(w, "invalid sign-in state, please try again", http.StatusBadRequest)
+		fail(ErrorState, http.StatusBadRequest)
 		return
 	}
 
 	code := r.URL.Query().Get("code")
 	if code == "" {
-		http.Error(w, "sign-in was cancelled", http.StatusBadRequest)
+		fail(ErrorCancelled, http.StatusBadRequest)
 		return
 	}
 
 	emails, err := a.verifiedEmails(ctx, code)
 	if err != nil {
 		l.Errorw("github oauth exchange failed", zap.Error(err))
-		http.Error(w, "sign-in failed", http.StatusBadGateway)
+		fail(ErrorFailed, http.StatusBadGateway)
 		return
 	}
 
@@ -314,14 +418,28 @@ func (a *Authenticator) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	if email == "" {
 		l.Warnw("sign-in denied: no allowlisted verified email", "emails", emails)
-		http.Error(w, "this GitHub account is not allowed to sign in", http.StatusForbidden)
+		fail(ErrorDenied, http.StatusForbidden)
 		return
 	}
 
-	exp := a.cfg.Now().Add(sessionTTL).Unix()
-	a.setCookie(w, r, sessionCookie, a.sign(email+"|"+strconv.FormatInt(exp, 10)), sessionTTL)
+	now := a.cfg.Now()
+	var since int64
+	if a.cfg.OnLogin != nil {
+		// Losing the "since" marker only blunts a dashboard statistic, so a
+		// failure here must not block the sign-in.
+		previous, err := a.cfg.OnLogin(ctx, email, now)
+		switch {
+		case err != nil:
+			l.Errorw("recording sign-in failed", zap.Error(err), "email", email)
+		case !previous.IsZero():
+			since = previous.Unix()
+		}
+	}
+
+	payload := fmt.Sprintf("%s|%d|%d", email, now.Add(sessionTTL).Unix(), since)
+	a.setCookie(w, r, sessionCookie, a.sign(payload), sessionTTL)
 	l.Infow("sign-in", "email", email)
-	http.Redirect(w, r, safeNext(next), http.StatusFound)
+	http.Redirect(w, r, next, http.StatusFound)
 }
 
 func (a *Authenticator) handleLogout(w http.ResponseWriter, r *http.Request) {

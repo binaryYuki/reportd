@@ -19,6 +19,8 @@ go build .       # Build binary
 
 - `main.go` — Server entrypoint, Chi router, and report parsing handlers.
 - `pkg/db` — GORM models, dialects (MySQL, Postgres, SQLite), dashboard queries, and the storage cap (`retention.go`).
+- Projects live in the `projects` table and are cached in memory (`projects.go`), so ingestion never queries the database to check a name. Every `{service}` route goes through `requireProject`; unknown names get 404.
+- Templates: `head.tmpl` and `topbar.tmpl` are partials shared by `index.tmpl` and `view.tmpl`. Build DOM with the `el()` helper, never `innerHTML`: report contents are untrusted.
 - `pkg/auth` — GitHub OAuth sign-in with an email allowlist. Dashboard pages and read APIs are gated; ingestion POSTs and `/api/status` must stay public.
 - `TEST_MYSQL_URL` / `TEST_DATABASE_URL` enable the MySQL / Postgres integration tests in `pkg/db`.
 - Follow icco Go conventions (`go.icco.me/gutil` for logging and structured JSON).

@@ -110,7 +110,7 @@ func newTestRouter(t *testing.T) (http.Handler, *gorm.DB, *recordingWriters) {
 		defer cancel()
 		_ = rec.ingest.Close(ctx)
 	})
-	router := newRouter(pgDB, rec.ingest, rec.writeReport, rec.writeAnalytics, rec.writeSecurityReport, nil)
+	router := newRouter(pgDB, rec.ingest, rec.writeReport, rec.writeAnalytics, rec.writeSecurityReport, nil, nil)
 	return router, pgDB, rec
 }
 

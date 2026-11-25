@@ -94,6 +94,14 @@ func TestConnectMySQLAndQueryHelpers(t *testing.T) {
 	seedQueryFixtures(t, d, service)
 	assertQueryHelpers(ctx, t, d, service)
 
+	t.Run("logins and counts", func(t *testing.T) {
+		assertLoginsAndCounts(ctx, t, d, "test-"+randHex(t, 8))
+	})
+
+	t.Run("projects", func(t *testing.T) {
+		assertProjects(ctx, t, d, "test-"+randHex(t, 8))
+	})
+
 	t.Run("storage limit", func(t *testing.T) {
 		assertStorageLimit(ctx, t, d, service)
 	})

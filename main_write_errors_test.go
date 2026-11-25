@@ -50,7 +50,7 @@ func TestHandlerWriteErrors(t *testing.T) {
 		{"robotsTxt", robotsTxtHandler()},
 		{"corsPreflight", corsPreflightHandler()},
 		{"getReports", getReportsHandler(pgDB)},
-		{"getServices", getServicesHandler(pgDB)},
+		{"getServices", getServicesHandler(pgDB, nil)},
 		{"getAnalytics", getAnalyticsHandler(pgDB)},
 		{"apiVitals", apiVitalsHandler(pgDB)},
 		{"apiReports", apiReportsHandler(pgDB)},

@@ -1,7 +1,9 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -60,7 +62,7 @@ func newTestAuth(t *testing.T, gh *httptest.Server, now func() time.Time) (*Auth
 	}
 
 	r := chi.NewRouter()
-	a.Routes(r)
+	a.Routes(r, nil)
 	r.With(a.RequirePage).Get("/page", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("page:" + EmailFromContext(r.Context())))
 	})
@@ -68,6 +70,15 @@ func newTestAuth(t *testing.T, gh *httptest.Server, now func() time.Time) (*Auth
 		_, _ = w.Write([]byte("api"))
 	})
 	return a, r
+}
+
+// startLogin presses the sign-in button: a form POST carrying next.
+func startLogin(h http.Handler, next string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, LoginPath, strings.NewReader(url.Values{"next": {next}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
 }
 
 func do(h http.Handler, method, target string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
@@ -94,9 +105,9 @@ func cookie(t *testing.T, rec *httptest.ResponseRecorder, name string) *http.Coo
 // login walks the whole flow and returns the callback response.
 func login(t *testing.T, h http.Handler, next, code string) *httptest.ResponseRecorder {
 	t.Helper()
-	rec := do(h, http.MethodGet, LoginPath+"?next="+url.QueryEscape(next))
-	if rec.Code != http.StatusFound {
-		t.Fatalf("login status = %d, want 302", rec.Code)
+	rec := startLogin(h, next)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("login status = %d, want 303", rec.Code)
 	}
 	loc, err := url.Parse(rec.Header().Get("Location"))
 	if err != nil {
@@ -175,7 +186,7 @@ func TestCallbackRejectsBadState(t *testing.T) {
 	}
 
 	// Cookie present but the query state does not match it.
-	start := do(h, http.MethodGet, LoginPath)
+	start := startLogin(h, "/")
 	rec := do(h, http.MethodGet, CallbackPath+"?code=good-code&state=forged", cookie(t, start, stateCookie))
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("mismatched state: status = %d, want 400", rec.Code)
@@ -249,7 +260,7 @@ func TestLogoutClearsSession(t *testing.T) {
 
 func TestSecureCookieBehindHTTPSProxy(t *testing.T) {
 	_, h := newTestAuth(t, nil, nil)
-	req := httptest.NewRequest(http.MethodGet, LoginPath, nil)
+	req := httptest.NewRequest(http.MethodPost, LoginPath, nil)
 	req.Header.Set("X-Forwarded-Proto", "https")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -299,5 +310,129 @@ func TestParseAllowedEmails(t *testing.T) {
 	want := []string{"a@x.com", "b@x.com", "c@x.com"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Errorf("ParseAllowedEmails() = %v, want %v", got, want)
+	}
+}
+
+// OnLogin's answer (the previous sign-in) must ride along in the session.
+func TestOnLoginSinceReachesHandlers(t *testing.T) {
+	gh := fakeGitHub(t, []ghEmail{{Email: "me@example.com", Verified: true}})
+	previous := time.Unix(1_700_000_000, 0)
+
+	var gotEmail string
+	a, err := New(Config{
+		ClientID: "id", ClientSecret: "secret", AllowedEmails: []string{"me@example.com"},
+		SessionSecret: []byte(strings.Repeat("k", 32)),
+		AuthURL:       "https://github.test/authorize",
+		TokenURL:      gh.URL + "/token",
+		EmailsURL:     gh.URL + "/emails",
+		OnLogin: func(_ context.Context, email string, _ time.Time) (time.Time, error) {
+			gotEmail = email
+			return previous, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	r := chi.NewRouter()
+	a.Routes(r, nil)
+	var since time.Time
+	r.With(a.RequirePage).Get("/page", func(_ http.ResponseWriter, r *http.Request) {
+		since = SinceFromContext(r.Context())
+	})
+
+	rec := login(t, r, "/", "good-code")
+	if rec.Code != http.StatusFound {
+		t.Fatalf("callback status = %d, want 302", rec.Code)
+	}
+	if gotEmail != "me@example.com" {
+		t.Errorf("OnLogin email = %q, want me@example.com", gotEmail)
+	}
+
+	do(r, http.MethodGet, "/page", cookie(t, rec, sessionCookie))
+	if !since.Equal(previous) {
+		t.Errorf("SinceFromContext = %v, want %v", since, previous)
+	}
+}
+
+// A failing OnLogin must not lock the user out.
+func TestOnLoginErrorStillSignsIn(t *testing.T) {
+	gh := fakeGitHub(t, []ghEmail{{Email: "me@example.com", Verified: true}})
+	a, err := New(Config{
+		ClientID: "id", ClientSecret: "secret", AllowedEmails: []string{"me@example.com"},
+		SessionSecret: []byte(strings.Repeat("k", 32)),
+		AuthURL:       "https://github.test/authorize",
+		TokenURL:      gh.URL + "/token",
+		EmailsURL:     gh.URL + "/emails",
+		OnLogin: func(context.Context, string, time.Time) (time.Time, error) {
+			return time.Time{}, errors.New("database down")
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	r := chi.NewRouter()
+	a.Routes(r, nil)
+	r.With(a.RequireAPI).Get("/api", func(w http.ResponseWriter, r *http.Request) {
+		if !SinceFromContext(r.Context()).IsZero() {
+			w.WriteHeader(http.StatusTeapot)
+		}
+	})
+
+	rec := login(t, r, "/", "good-code")
+	if rec.Code != http.StatusFound {
+		t.Fatalf("callback status = %d, want 302", rec.Code)
+	}
+	if got := do(r, http.MethodGet, "/api", cookie(t, rec, sessionCookie)); got.Code != http.StatusOK {
+		t.Errorf("/api status = %d, want 200 with an unknown since", got.Code)
+	}
+}
+
+// Visiting the sign-in page must not contact GitHub by itself; only the
+// button (a POST) starts the flow.
+func TestLoginPageDoesNotRedirectToGitHub(t *testing.T) {
+	a, h := newTestAuth(t, nil, nil)
+
+	rec := do(h, http.MethodGet, LoginPath+"?next=%2Fview%2Fsite")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET login status = %d, want 200", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "" {
+		t.Errorf("GET login redirected to %q, want no redirect", loc)
+	}
+	if len(rec.Result().Cookies()) != 0 {
+		t.Error("GET login set a cookie; the flow must not start before the button is pressed")
+	}
+	body := rec.Body.String()
+	for _, want := range []string{`method="post"`, `action="/auth/login"`, `name="next" value="/view/site"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("login page is missing %q", want)
+		}
+	}
+	if rec.Header().Get("X-Robots-Tag") != "noindex" || !strings.Contains(rec.Header().Get("Cache-Control"), "no-store") {
+		t.Errorf("login page must be noindex and no-store, got %q / %q", rec.Header().Get("X-Robots-Tag"), rec.Header().Get("Cache-Control"))
+	}
+
+	// An off-site next is not echoed into the form.
+	if body := do(h, http.MethodGet, LoginPath+"?next=https%3A%2F%2Fevil.test").Body.String(); strings.Contains(body, "evil.test") {
+		t.Error("login page echoed an off-site next")
+	}
+
+	// Already signed in: straight back to the page, no button needed.
+	session := &http.Cookie{Name: sessionCookie, Value: a.sign("me@example.com|99999999999")}
+	if rec := do(h, http.MethodGet, LoginPath+"?next=%2Fview%2Fsite", session); rec.Code != http.StatusFound || rec.Header().Get("Location") != "/view/site" {
+		t.Errorf("signed-in GET login = %d -> %q, want 302 -> /view/site", rec.Code, rec.Header().Get("Location"))
+	}
+}
+
+// A refused sign-in shows the sign-in page again with the reason.
+func TestDeniedLoginShowsLoginPage(t *testing.T) {
+	_, h := newTestAuth(t, fakeGitHub(t, []ghEmail{{Email: "stranger@example.com", Verified: true}}), nil)
+	rec := login(t, h, "/view/site", "good-code")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, ErrorDenied) || !strings.Contains(body, `action="/auth/login"`) {
+		t.Errorf("denied page should name the error and offer the button again, got %q", body)
 	}
 }

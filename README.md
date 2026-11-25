@@ -53,6 +53,18 @@ reportd is configured via environment variables (prefix `REPORTD_`) or command-l
 | `REPORTD_REPORTS_V2_TABLE` | `--reports_v2_table` | No | BigQuery table for Reporting API v1 data |
 | `PORT` | -- | No | HTTP port (default: 8080) |
 
+### Projects
+
+Each site you monitor is a project. Projects are created and deleted in the dashboard and stored in the database; there is nothing to configure.
+
+A project has its own endpoints (`/analytics/blog`, `/reporting/blog`, `/report/blog`), its own page at `/view/blog`, and its own data; nothing is shared between projects. Names may use letters, digits, `-` and `_`, up to 32 characters. Each project page has an "接入方法" section with the exact script and headers to add to that site.
+
+Only existing projects accept reports. Every route answers `404` for any other name, so nobody can create a project by posting to a new one. Deleting a project stops its ingestion at once and permanently deletes its data in the background.
+
+The dashboard reports its own Web Vitals and browser reports to a project named `reportd`; create it to collect them.
+
+The top of the index page shows what arrived since your previous sign-in as three numbers: total, Web Vitals measurements, and browser reports. On a first sign-in it covers all stored data.
+
 ### Sign-in (GitHub OAuth)
 
 reportd refuses to start without sign-in configured.
@@ -66,11 +78,13 @@ REPORTD_ALLOWED_EMAILS=you@example.com,teammate@example.com
 REPORTD_SESSION_SECRET=$(openssl rand -hex 32)
 ```
 
+Anonymous visitors land on a sign-in page at `/auth/login`. Nothing is sent to GitHub until the visitor presses the button there, so crawlers and stray requests never trigger automated redirects to GitHub from your domain. Responses also carry `Referrer-Policy: no-referrer`.
+
 A GitHub account gets in when one of its **verified** emails is on the allowlist (matching is case-insensitive). Sessions last 7 days; removing an email from the allowlist and restarting revokes its sessions.
 
 | Routes | Access |
 |--------|--------|
-| `GET /`, `GET /view/{service}` | Sign-in required; anonymous visitors are redirected to GitHub |
+| `GET /`, `GET /view/{service}` | Sign-in required; anonymous visitors are sent to the sign-in page |
 | `GET /api/*`, `GET /services`, `GET /reports/{service}`, `GET /analytics/{service}`, `GET /metrics` | Sign-in required; anonymous requests get `401` |
 | `POST /analytics/{service}`, `POST /report/{service}`, `POST /reporting/{service}`, `GET /api/status` | Public |
 
@@ -263,17 +277,17 @@ Report-To: {"group":"default","max_age":10886400,"endpoints":[{"url":"https://yo
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /auth/login` | Start GitHub sign-in |
+| `GET /auth/login` | Sign-in page |
+| `POST /auth/login` | Start GitHub sign-in (the page's button) |
 | `GET /auth/callback` | OAuth callback (register this on the GitHub OAuth app) |
 | `POST /auth/logout` | Sign out |
 
 ## Dashboard features
 
-The service view page provides:
+The index lists the projects, each with its rated Core Web Vitals, and has the form for creating one. A project page shows:
 
-- **Core Web Vitals cards** with p75 values rated against Google's thresholds (good / needs improvement / poor)
-- **Time-series charts** for each metric with threshold bands
-- **Report volume chart** showing report counts by type over time
-- **Recent CSP violations table** with violated directive, blocked URI, document URI, and source location
-- **Recent reports table** for deprecation warnings, interventions, crashes, and other browser reports
-- **Top violated directives** bar chart showing the most frequently violated CSP directives
+- **Web Vitals tiles** for LCP, INP, CLS, FCP and TTFB: the trailing 28-day average rated against Google's thresholds (good / needs improvement / poor), with a 90-day trend line
+- **Report volume**: the total and a per-day bar chart for the last 90 days, plus a breakdown by report type
+- **Most violated CSP directives** over the last 30 days
+- **Recent reports**: the latest 20 across all types, with what happened and where
+- **Setup instructions** with the project's own endpoints filled in

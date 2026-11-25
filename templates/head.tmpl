@@ -1,0 +1,71 @@
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="dark">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      body { font-feature-settings: "tnum"; }
+      :focus-visible { outline: 2px solid #60a5fa; outline-offset: 2px; }
+    </style>
+
+    <script type="module">
+      import { onCLS, onINP, onLCP, onFCP, onTTFB } from 'https://unpkg.com/web-vitals@5?module';
+
+      function sendToAnalytics(metric) {
+        const body = JSON.stringify(metric);
+        (navigator.sendBeacon && navigator.sendBeacon('https://pawprint.catyuki.com/analytics/reportd', body)) ||
+          fetch('https://pawprint.catyuki.com/analytics/reportd', { body, method: 'POST', keepalive: true });
+      }
+
+      onCLS(sendToAnalytics);
+      onFCP(sendToAnalytics);
+      onINP(sendToAnalytics);
+      onLCP(sendToAnalytics);
+      onTTFB(sendToAnalytics);
+    </script>
+
+    <script>
+      // Google's Core Web Vitals thresholds: at or below "good" is good,
+      // above "poor" is poor, in between needs improvement.
+      const VITALS = {
+        LCP:  { label: '最大内容绘制', good: 2500, poor: 4000, unit: 'ms' },
+        INP:  { label: '交互响应',     good: 200,  poor: 500,  unit: 'ms' },
+        CLS:  { label: '布局偏移',     good: 0.1,  poor: 0.25, unit: '' },
+        FCP:  { label: '首次内容绘制', good: 1800, poor: 3000, unit: 'ms' },
+        TTFB: { label: '首字节时间',   good: 800,  poor: 1800, unit: 'ms' },
+      };
+
+      const RATINGS = {
+        good: { text: '良好',   color: '#4ade80', chip: 'bg-green-950 text-green-400 ring-green-900' },
+        okay: { text: '待改进', color: '#fbbf24', chip: 'bg-amber-950 text-amber-400 ring-amber-900' },
+        poor: { text: '较差',   color: '#f87171', chip: 'bg-red-950 text-red-400 ring-red-900' },
+      };
+
+      function rate(metric, value) {
+        const t = VITALS[metric];
+        if (!t) return null;
+        if (value <= t.good) return RATINGS.good;
+        if (value <= t.poor) return RATINGS.okay;
+        return RATINGS.poor;
+      }
+
+      function formatVital(metric, value) {
+        const t = VITALS[metric];
+        if (t && t.unit === 'ms') {
+          return value >= 1000 ? (value / 1000).toFixed(2) + ' s' : Math.round(value) + ' ms';
+        }
+        return value.toFixed(3);
+      }
+
+      // el('div', {class: 'x', title: 'y'}, child, 'text', ...) builds DOM
+      // without innerHTML: report contents come from untrusted browsers.
+      function el(tag, attrs, ...children) {
+        const node = document.createElement(tag);
+        for (const [k, v] of Object.entries(attrs || {})) {
+          if (v !== null && v !== undefined) node.setAttribute(k, v);
+        }
+        for (const child of children) {
+          if (child !== null && child !== undefined) node.append(child);
+        }
+        return node;
+      }
+    </script>

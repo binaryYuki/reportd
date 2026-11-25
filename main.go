@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -135,11 +136,6 @@ func main() {
 		log.Fatalw("database_url is required")
 	}
 
-	authn, err := newAuthenticator(*githubClientID, *githubClientSecret, *allowedEmails, *sessionSecret)
-	if err != nil {
-		log.Fatalw("dashboard sign-in is not configured", zap.Error(err))
-	}
-
 	ctx := context.Background()
 
 	registry := prometheus.NewRegistry()
@@ -171,6 +167,20 @@ func main() {
 		log.Fatalw("could not auto-migrate database", zap.Error(err))
 	}
 	log.Infow("Database connected and migrated")
+
+	projects, err := newProjectStore(ctx, pgDB)
+	if err != nil {
+		log.Fatalw("could not load projects", zap.Error(err))
+	}
+	log.Infow("Projects loaded", "projects", projects.List())
+
+	recordLogin := func(ctx context.Context, email string, at time.Time) (time.Time, error) {
+		return db.RecordLogin(ctx, pgDB, email, at)
+	}
+	authn, err := newAuthenticator(*githubClientID, *githubClientSecret, *allowedEmails, *sessionSecret, recordLogin)
+	if err != nil {
+		log.Fatalw("dashboard sign-in is not configured", zap.Error(err))
+	}
 
 	var (
 		writeReport         reportToBQWriter
@@ -211,6 +221,7 @@ func main() {
 
 	pruneCtx, stopPrune := context.WithCancel(ctx)
 	defer stopPrune()
+	go projects.refreshLoop(pruneCtx, projectRefreshInterval)
 	if *maxStorageGB > 0 {
 		maxBytes := int64(*maxStorageGB * (1 << 30))
 		log.Infow("Storage cap enabled", "max_bytes", maxBytes)
@@ -221,7 +232,7 @@ func main() {
 
 	ingest := db.NewWriter(pgDB, db.WriterOptions{OnDrop: logDroppedRows})
 
-	r := newRouter(pgDB, ingest, writeReport, writeAnalytics, writeSecurityReport, authn)
+	r := newRouter(pgDB, ingest, writeReport, writeAnalytics, writeSecurityReport, authn, projects)
 	r.Method(http.MethodGet, "/metrics", authn.RequireAPI(promhttp.HandlerFor(registry, promhttp.HandlerOpts{})))
 
 	handler := otelhttp.NewHandler(r, serverName,
@@ -270,9 +281,13 @@ func main() {
 // storageCheckInterval is how often the storage cap is checked.
 const storageCheckInterval = 10 * time.Minute
 
+// projectRefreshInterval is how often the project list is re-read from the
+// database, to notice changes made by another instance or by hand.
+const projectRefreshInterval = time.Minute
+
 // newAuthenticator builds the dashboard authenticator from flag values. An
 // unset session secret gets a random one, which signs everyone out on restart.
-func newAuthenticator(clientID, clientSecret, allowedEmails, sessionSecret string) (*auth.Authenticator, error) {
+func newAuthenticator(clientID, clientSecret, allowedEmails, sessionSecret string, onLogin func(context.Context, string, time.Time) (time.Time, error)) (*auth.Authenticator, error) {
 	secret := []byte(sessionSecret)
 	if len(secret) == 0 {
 		secret = make([]byte, 32)
@@ -287,7 +302,28 @@ func newAuthenticator(clientID, clientSecret, allowedEmails, sessionSecret strin
 		ClientSecret:  clientSecret,
 		AllowedEmails: auth.ParseAllowedEmails(allowedEmails),
 		SessionSecret: secret,
+		OnLogin:       onLogin,
 	})
+}
+
+// requireProject answers 404 for a {service} that is not a project, so
+// nobody can conjure one by posting to a new name. A nil store (tests only)
+// allows every name. Malformed names fall through to the handlers, which
+// reject them with 400.
+func requireProject(projects *projectStore) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		if projects == nil {
+			return next
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			service := chi.URLParam(r, "service")
+			if lib.ValidateService(service) == nil && !projects.Has(service) {
+				http.Error(w, "unknown project", http.StatusNotFound)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // enforceStorageLimitLoop prunes the oldest rows whenever the database grows
@@ -319,8 +355,9 @@ func enforceStorageLimitLoop(ctx context.Context, d *gorm.DB, maxBytes int64, in
 // newRouter builds the chi router shared by main() and the handler tests;
 // /metrics is mounted by main() because it owns the prometheus registry.
 // Ingested rows go through ingest so handlers never wait on the database.
-// A nil authn leaves the dashboard open, which only the tests rely on.
-func newRouter(pgDB *gorm.DB, ingest *db.Writer, writeReport reportToBQWriter, writeAnalytics analyticsBQWriter, writeSecurityReport securityReportBQWriter, authn *auth.Authenticator) *chi.Mux {
+// A nil authn leaves the dashboard open, and a nil projects accepts every
+// project name; only the tests rely on either.
+func newRouter(pgDB *gorm.DB, ingest *db.Writer, writeReport reportToBQWriter, writeAnalytics analyticsBQWriter, writeSecurityReport securityReportBQWriter, authn *auth.Authenticator, projects *projectStore) *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(logging.Middleware(log.Desugar()))
 	r.Use(routeTag)
@@ -341,8 +378,8 @@ func newRouter(pgDB *gorm.DB, ingest *db.Writer, writeReport reportToBQWriter, w
 
 	r.Use(func(h http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("report-to", `{"group":"default","max_age":10886400,"endpoints":[{"url":"https://reportd.natwelch.com/report/reportd"}]}`)
-			w.Header().Set("reporting-endpoints", `default="https://reportd.natwelch.com/reporting/reportd"`)
+			w.Header().Set("report-to", `{"group":"default","max_age":10886400,"endpoints":[{"url":"https://pawprint.catyuki.com/report/reportd"}]}`)
+			w.Header().Set("reporting-endpoints", `default="https://pawprint.catyuki.com/reporting/reportd"`)
 
 			h.ServeHTTP(w, r)
 		})
@@ -378,42 +415,139 @@ func newRouter(pgDB *gorm.DB, ingest *db.Writer, writeReport reportToBQWriter, w
 	page := func(h http.Handler) http.Handler { return h }
 	api := page
 	if authn != nil {
-		authn.Routes(r)
+		authn.Routes(r, func(w http.ResponseWriter, r *http.Request, data auth.LoginData) {
+			if err := re.HTML(w, data.Status, "login", data); err != nil {
+				logging.FromContext(r.Context()).Errorw("error rendering login", zap.Error(err))
+				http.Error(w, "could not render sign-in page", http.StatusInternalServerError)
+			}
+		})
 		page, api = authn.RequirePage, authn.RequireAPI
 	}
 
-	r.With(page).Get("/", indexHandler(re, pgDB))
-	r.With(page).Get("/view/{service}", viewHandler(re))
+	// Every {service} route is limited to existing projects.
+	project := requireProject(projects)
+
+	if projects != nil {
+		r.With(page, sameOrigin).Post("/projects", createProjectHandler(projects))
+		r.With(page, sameOrigin, project).Post("/projects/{service}/delete", deleteProjectHandler(projects))
+	}
+
+	r.With(page).Get("/", indexHandler(re, pgDB, projects))
+	r.With(page, project).Get("/view/{service}", viewHandler(re, projects != nil))
 	r.Get(statusPath, statusHandler(ingest))
 
-	r.Options("/report/{service}", corsPreflightHandler())
-	r.Options("/analytics/{service}", corsPreflightHandler())
+	r.With(project).Options("/report/{service}", corsPreflightHandler())
+	r.With(project).Options("/analytics/{service}", corsPreflightHandler())
 
-	r.With(api).Get("/reports/{service}", getReportsHandler(pgDB))
-	r.Post("/report/{service}", postReportHandler(ingest, writeReport))
+	r.With(api, project).Get("/reports/{service}", getReportsHandler(pgDB))
+	r.With(project).Post("/report/{service}", postReportHandler(ingest, writeReport))
 
-	r.With(api).Get("/services", getServicesHandler(pgDB))
-	r.With(api).Get("/analytics/{service}", getAnalyticsHandler(pgDB))
-	r.Post("/analytics/{service}", postAnalyticsHandler(ingest, writeAnalytics))
+	r.With(api).Get("/services", getServicesHandler(pgDB, projects))
+	r.With(api, project).Get("/analytics/{service}", getAnalyticsHandler(pgDB))
+	r.With(project).Post("/analytics/{service}", postAnalyticsHandler(ingest, writeAnalytics))
 
-	r.Post("/reporting/{service}", postReportingHandler(ingest, writeSecurityReport))
+	r.With(project).Post("/reporting/{service}", postReportingHandler(ingest, writeSecurityReport))
 
-	r.With(api).Get("/api/vitals/{service}", apiVitalsHandler(pgDB))
-	r.With(api).Get("/api/reports/{service}", apiReportsHandler(pgDB))
+	r.With(api, project).Get("/api/vitals/{service}", apiVitalsHandler(pgDB))
+	r.With(api, project).Get("/api/reports/{service}", apiReportsHandler(pgDB))
 
 	return r
 }
 
-func indexHandler(re *render.Render, pgDB *gorm.DB) http.HandlerFunc {
+// listServices returns the projects, or (with a nil store, tests only) every
+// service that has data.
+func listServices(ctx context.Context, pgDB *gorm.DB, projects *projectStore) ([]string, error) {
+	if projects != nil {
+		return projects.List(), nil
+	}
+	return db.GetServices(ctx, pgDB)
+}
+
+// sameOrigin rejects state-changing requests that a browser marks as coming
+// from another site. The session cookie is SameSite=Lax, which already keeps
+// it off cross-site POSTs; this is a second line of defence.
+func sameOrigin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
+			http.Error(w, "cross-site request refused", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// createProjectHandler adds the project named in the form and returns to the
+// index, which shows it (or the reason it was refused).
+func createProjectHandler(projects *projectStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := queryContext(r.Context())
 		defer cancel()
 		l := logging.FromContext(ctx)
 
-		services, err := db.GetServices(ctx, pgDB)
+		r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+		name := strings.TrimSpace(r.PostFormValue("name"))
+		if err := lib.ValidateService(name); err != nil {
+			http.Redirect(w, r, "/?error=name", http.StatusSeeOther)
+			return
+		}
+
+		if err := projects.Create(ctx, name); err != nil {
+			l.Errorw("error creating project", zap.Error(err), "project", name)
+			http.Redirect(w, r, "/?error=storage", http.StatusSeeOther)
+			return
+		}
+		l.Infow("project created", "project", name, "by", auth.EmailFromContext(ctx))
+		http.Redirect(w, r, "/view/"+name, http.StatusSeeOther)
+	}
+}
+
+// deleteProjectHandler removes a project and, in the background, its data.
+func deleteProjectHandler(projects *projectStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := queryContext(r.Context())
+		defer cancel()
+		l := logging.FromContext(ctx)
+		name := chi.URLParam(r, "service")
+
+		if err := projects.Delete(ctx, name, nil); err != nil {
+			l.Errorw("error deleting project", zap.Error(err), "project", name)
+			http.Redirect(w, r, "/?error=storage", http.StatusSeeOther)
+			return
+		}
+		l.Infow("project deleted", "project", name, "by", auth.EmailFromContext(ctx))
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+	}
+}
+
+func indexHandler(re *render.Render, pgDB *gorm.DB, projects *projectStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := queryContext(r.Context())
+		defer cancel()
+		l := logging.FromContext(ctx)
+
+		services, err := listServices(ctx, pgDB, projects)
 		if err != nil {
 			l.Errorw("error getting services", zap.Error(err))
 			http.Error(w, "could not get services", 500)
+			return
+		}
+
+		// What arrived since the user's previous sign-in; everything when
+		// that is unknown (first sign-in).
+		since := auth.SinceFromContext(r.Context())
+		// With no projects there is nothing to count; an empty filter would
+		// mean "everything".
+		var counts db.IngestCounts
+		if projects == nil || len(services) > 0 {
+			var filter []string
+			if projects != nil {
+				filter = services
+			}
+			counts, err = db.CountSince(ctx, pgDB, since, filter)
+		}
+		if err != nil {
+			l.Errorw("error counting rows since last login", zap.Error(err))
+			http.Error(w, "could not get statistics", 500)
 			return
 		}
 
@@ -423,13 +557,34 @@ func indexHandler(re *render.Render, pgDB *gorm.DB) http.HandlerFunc {
 			health = make(map[string][]db.ServiceHealth)
 		}
 
-		healthJSON, _ := json.Marshal(health)
+		// Health is computed over everything stored; show only the listed
+		// projects so data from unconfigured names stays hidden.
+		shown := make(map[string][]db.ServiceHealth, len(services))
+		for _, name := range services {
+			if h, ok := health[name]; ok {
+				shown[name] = h
+			}
+		}
+
+		healthJSON, _ := json.Marshal(shown)
 
 		if err := re.HTML(w, http.StatusOK, "index", struct {
 			Services   []string
 			HealthJSON string
 			User       string
+			Counts     db.IngestCounts
+			// HasSince is false when Counts covers all stored data.
+			HasSince bool
+			Since    string
+			// CanManage is whether projects can be created here.
+			CanManage bool
+			Error     string
 		}{
+			CanManage:  projects != nil,
+			Error:      r.URL.Query().Get("error"),
+			Counts:     counts,
+			HasSince:   !since.IsZero(),
+			Since:      since.UTC().Format("2006-01-02 15:04 UTC"),
 			User:       auth.EmailFromContext(r.Context()),
 			Services:   services,
 			HealthJSON: string(healthJSON),
@@ -441,7 +596,7 @@ func indexHandler(re *render.Render, pgDB *gorm.DB) http.HandlerFunc {
 	}
 }
 
-func viewHandler(re *render.Render) http.HandlerFunc {
+func viewHandler(re *render.Render, canManage bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		l := logging.FromContext(r.Context())
 		service := chi.URLParam(r, "service")
@@ -455,9 +610,12 @@ func viewHandler(re *render.Render) http.HandlerFunc {
 		if err := re.HTML(w, http.StatusOK, "view", struct {
 			Service string
 			User    string
+			// CanManage is whether the project can be deleted here.
+			CanManage bool
 		}{
-			User:    auth.EmailFromContext(r.Context()),
-			Service: service,
+			CanManage: canManage,
+			User:      auth.EmailFromContext(r.Context()),
+			Service:   service,
 		}); err != nil {
 			l.Errorw("error rendering view", zap.Error(err), "service", service)
 			http.Error(w, "could not render view", 500)
@@ -620,12 +778,12 @@ func postReportHandler(ingest *db.Writer, writeBQ reportToBQWriter) http.Handler
 	}
 }
 
-func getServicesHandler(pgDB *gorm.DB) http.HandlerFunc {
+func getServicesHandler(pgDB *gorm.DB, projects *projectStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		l := logging.FromContext(ctx)
 
-		data, err := db.GetServices(ctx, pgDB)
+		data, err := listServices(ctx, pgDB, projects)
 		if err != nil {
 			l.Errorw("error seen during services get", zap.Error(err))
 			http.Error(w, "processing error", 500)
