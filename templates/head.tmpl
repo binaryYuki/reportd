@@ -7,13 +7,14 @@
       :focus-visible { outline: 2px solid #60a5fa; outline-offset: 2px; }
     </style>
 
+    {{ if selfReport }}
     <script type="module">
       import { onCLS, onINP, onLCP, onFCP, onTTFB } from 'https://unpkg.com/web-vitals@5?module';
 
       function sendToAnalytics(metric) {
         const body = JSON.stringify(metric);
-        (navigator.sendBeacon && navigator.sendBeacon('https://pawprint.catyuki.com/analytics/reportd', body)) ||
-          fetch('https://pawprint.catyuki.com/analytics/reportd', { body, method: 'POST', keepalive: true });
+        (navigator.sendBeacon && navigator.sendBeacon('/analytics/reportd', body)) ||
+          fetch('/analytics/reportd', { body, method: 'POST', keepalive: true });
       }
 
       onCLS(sendToAnalytics);
@@ -22,6 +23,7 @@
       onLCP(sendToAnalytics);
       onTTFB(sendToAnalytics);
     </script>
+    {{ end }}
 
     <script>
       // Google's Core Web Vitals thresholds: at or below "good" is good,

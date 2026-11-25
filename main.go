@@ -11,6 +11,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"html/template"
 	"io"
 	"io/fs"
 	"mime"
@@ -400,6 +401,12 @@ func newRouter(pgDB *gorm.DB, ingest *db.Writer, writeReport reportToBQWriter, w
 	r.Use(secureMiddleware.Handler)
 
 	re := render.New(render.Options{
+		// The dashboard reports its own Web Vitals to the selfReportProject
+		// project, but only once that project exists: otherwise every page
+		// view would log a rejected request in the browser console.
+		Funcs: []template.FuncMap{{
+			"selfReport": func() bool { return projects == nil || projects.Has(selfReportProject) },
+		}},
 		Directory:  ".",
 		FileSystem: &render.EmbedFileSystem{FS: templates.FS},
 		Extensions: []string{".tmpl"},
@@ -708,6 +715,13 @@ func getReportsHandler(pgDB *gorm.DB) http.HandlerFunc {
 // can pin, and with it the worst-case size of the ingest queue.
 const maxIngestBodyBytes = 1 << 20
 
+// maxReportsPerRequest caps how many reports one batched POST may add, so a
+// single anonymous request cannot fill the ingest queue.
+const maxReportsPerRequest = 500
+
+// selfReportProject is the project the dashboard's own pages report to.
+const selfReportProject = "reportd"
+
 // logDroppedRows reports rows the ingest writer could not persist. Clients
 // were already answered, so the log is the only trace of the loss.
 func logDroppedRows(rows int, err error) {
@@ -891,26 +905,42 @@ func postReportingHandler(ingest *db.Writer, writeBQ securityReportBQWriter) htt
 		bodyStr := buf.String()
 
 		l.Infow("reporting received", "content-type", contentType, "service", service, "user-agent", r.UserAgent())
-		var reports *reporting.SecurityReport
+		var reports []*reporting.SecurityReport
 		if media == "application/csp-report" {
-			reports, err = reporting.ParseLegacyCSPReport(bodyStr, service)
+			var one *reporting.SecurityReport
+			if one, err = reporting.ParseLegacyCSPReport(bodyStr, service); err == nil {
+				reports = []*reporting.SecurityReport{one}
+			}
 		} else {
-			reports, err = reporting.ParseReport(bodyStr, service)
+			reports, err = reporting.ParseReports(bodyStr, service)
 		}
-		if err != nil {
+		if err != nil && len(reports) == 0 {
 			l.Errorw("error on parsing reporting data", zap.Error(err), "service", service, "content-type", contentType, "body", bodyStr)
 			http.Error(w, "uploading error", 500)
 			return
 		}
+		if err != nil {
+			l.Warnw("skipped unparseable reports in batch", zap.Error(err), "service", service, "parsed", len(reports))
+		}
+		if len(reports) > maxReportsPerRequest {
+			l.Warnw("truncating oversized report batch", "service", service, "received", len(reports), "kept", maxReportsPerRequest)
+			reports = reports[:maxReportsPerRequest]
+		}
 
-		l.Infow("reporting parsed", "reports", reports, "service", service, "content-type", contentType, "user-agent", r.UserAgent())
+		l.Infow("reporting parsed", "count", len(reports), "service", service, "content-type", contentType, "user-agent", r.UserAgent())
 
-		ingest.Enqueue(db.SecurityReportEntryFromReport(reports))
+		for _, report := range reports {
+			ingest.Enqueue(db.SecurityReportEntryFromReport(report))
+		}
 
 		w.WriteHeader(http.StatusNoContent)
 
 		if writeBQ != nil {
-			go writeBQ(context.WithoutCancel(ctx), reports)
+			go func(ctx context.Context) {
+				for _, report := range reports {
+					writeBQ(ctx, report)
+				}
+			}(context.WithoutCancel(ctx))
 		}
 	}
 }

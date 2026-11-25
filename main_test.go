@@ -644,3 +644,54 @@ func TestRouteTagMiddleware(t *testing.T) {
 		t.Error("reporting-endpoints header should be set on every response")
 	}
 }
+
+// Browsers batch every queued report for an endpoint into one JSON array and
+// use camelCase body fields.
+func TestPostReportingHandlerBatch(t *testing.T) {
+	h, pgDB, rec := newTestRouter(t)
+
+	body := `[
+		{"age":0,"type":"csp-violation","url":"https://www.example.com/a","body":{"documentURL":"https://www.example.com/a","blockedURL":"https://example.invalid/test.js","effectiveDirective":"script-src-elem","originalPolicy":"script-src 'self'; report-to pawprint","disposition":"report","statusCode":200}},
+		{"age":3,"type":"deprecation","url":"https://www.example.com/b","body":{"id":"websql","anticipatedRemoval":"1/1/2020","message":"WebSQL is deprecated","sourceFile":"https://www.example.com/app.js","lineNumber":12,"columnNumber":4}},
+		"not a report"
+	]`
+	rr := do(t, h, http.MethodPost, "/reporting/svc", strings.NewReader(body), "application/reports+json")
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("batch: status = %d, want 204, body=%s", rr.Code, rr.Body.String())
+	}
+
+	rr = do(t, h, http.MethodPost, "/reporting/svc", strings.NewReader("[]"), "application/reports+json")
+	if rr.Code != http.StatusNoContent {
+		t.Errorf("empty batch: status = %d, want 204", rr.Code)
+	}
+
+	rr = do(t, h, http.MethodPost, "/reporting/svc", strings.NewReader(`["a","b"]`), "application/reports+json")
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("batch with no valid report: status = %d, want 500", rr.Code)
+	}
+
+	rec.flush(t)
+
+	var rows []db.SecurityReportEntry
+	if err := pgDB.Where("service = ?", "svc").Order("id").Find(&rows).Error; err != nil {
+		t.Fatalf("find: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows))
+	}
+
+	csp := rows[0]
+	if csp.ReportType != "csp-violation" || csp.EffectiveDirective != "script-src-elem" ||
+		csp.BlockedURI != "https://example.invalid/test.js" || csp.DocumentURI != "https://www.example.com/a" {
+		t.Errorf("csp row = %+v", csp)
+	}
+	if strings.Contains(string(csp.RawJSON), "websql") {
+		t.Error("each row should keep only its own report in raw_json")
+	}
+
+	dep := rows[1]
+	if dep.ReportType != "deprecation" || dep.Message != "WebSQL is deprecated" ||
+		dep.SourceFile != "https://www.example.com/app.js" || dep.LineNumber != 12 {
+		t.Errorf("deprecation row = %+v", dep)
+	}
+}

@@ -2,9 +2,12 @@
 package reporting
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/bigquery"
@@ -30,6 +33,43 @@ type CSPReportBody struct {
 	LineNumber         int32  `json:"line_number,omitempty"`
 	ColumnNumber       int32  `json:"column_number,omitempty"`
 	ScriptSample       string `json:"script_sample,omitempty"`
+}
+
+// UnmarshalJSON accepts both the snake_case names above and the camelCase
+// names browsers actually send in Reporting API v1 bodies (documentURL,
+// blockedURL, effectiveDirective, ...). Snake_case wins when both are set.
+func (b *CSPReportBody) UnmarshalJSON(data []byte) error {
+	type plain CSPReportBody
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+
+	var c struct {
+		DocumentURL        string `json:"documentURL"`
+		BlockedURL         string `json:"blockedURL"`
+		EffectiveDirective string `json:"effectiveDirective"`
+		OriginalPolicy     string `json:"originalPolicy"`
+		SourceFile         string `json:"sourceFile"`
+		LineNumber         int32  `json:"lineNumber"`
+		ColumnNumber       int32  `json:"columnNumber"`
+		Sample             string `json:"sample"`
+	}
+	if err := json.Unmarshal(data, &c); err != nil {
+		return err
+	}
+
+	p.DocumentURI = cmp.Or(p.DocumentURI, c.DocumentURL)
+	p.BlockedURI = cmp.Or(p.BlockedURI, c.BlockedURL)
+	p.EffectiveDirective = cmp.Or(p.EffectiveDirective, c.EffectiveDirective)
+	p.OriginalPolicy = cmp.Or(p.OriginalPolicy, c.OriginalPolicy)
+	p.SourceFile = cmp.Or(p.SourceFile, c.SourceFile)
+	p.LineNumber = cmp.Or(p.LineNumber, c.LineNumber)
+	p.ColumnNumber = cmp.Or(p.ColumnNumber, c.ColumnNumber)
+	p.ScriptSample = cmp.Or(p.ScriptSample, c.Sample)
+
+	*b = CSPReportBody(p)
+	return nil
 }
 
 // DeprecationReport signals use of a deprecated browser API.
@@ -209,18 +249,31 @@ func ParseReport(data, srv string) (*SecurityReport, error) {
 		if err := json.Unmarshal([]byte(data), &sr.Deprecation); err != nil {
 			return nil, err
 		}
-		// Populate NullString fields that json:"-" skips.
+		// Populate NullString fields that json:"-" skips, and the camelCase
+		// names browsers send for the rest.
 		var depJSON struct {
 			Body struct {
-				ID                 string `json:"id"`
-				AnticipatedRemoval string `json:"anticipated_removal"`
-				Message            string `json:"message"`
+				ID                      string `json:"id"`
+				AnticipatedRemoval      string `json:"anticipated_removal"`
+				AnticipatedRemovalCamel any    `json:"anticipatedRemoval"`
+				Message                 string `json:"message"`
+				SourceFile              string `json:"sourceFile"`
+				LineNumber              int32  `json:"lineNumber"`
+				ColumnNumber            int32  `json:"columnNumber"`
 			} `json:"body"`
 		}
 		if err := json.Unmarshal([]byte(data), &depJSON); err == nil {
-			sr.Deprecation.Body.ID = bigquery.NullString{StringVal: depJSON.Body.ID, Valid: depJSON.Body.ID != ""}
-			sr.Deprecation.Body.AnticipatedRemoval = bigquery.NullString{StringVal: depJSON.Body.AnticipatedRemoval, Valid: depJSON.Body.AnticipatedRemoval != ""}
-			sr.Deprecation.Body.Message = bigquery.NullString{StringVal: depJSON.Body.Message, Valid: depJSON.Body.Message != ""}
+			removal := depJSON.Body.AnticipatedRemoval
+			if s, ok := depJSON.Body.AnticipatedRemovalCamel.(string); ok && removal == "" {
+				removal = s
+			}
+			body := &sr.Deprecation.Body
+			body.ID = bigquery.NullString{StringVal: depJSON.Body.ID, Valid: depJSON.Body.ID != ""}
+			body.AnticipatedRemoval = bigquery.NullString{StringVal: removal, Valid: removal != ""}
+			body.Message = bigquery.NullString{StringVal: depJSON.Body.Message, Valid: depJSON.Body.Message != ""}
+			body.SourceFile = cmp.Or(body.SourceFile, depJSON.Body.SourceFile)
+			body.LineNumber = cmp.Or(body.LineNumber, depJSON.Body.LineNumber)
+			body.ColumnNumber = cmp.Or(body.ColumnNumber, depJSON.Body.ColumnNumber)
 		}
 	case "permissions-policy-violation":
 		if err := json.Unmarshal([]byte(data), &sr.PermissionsPolicy); err != nil {
@@ -251,6 +304,40 @@ func ParseReport(data, srv string) (*SecurityReport, error) {
 	}
 
 	return sr, nil
+}
+
+// ParseReports decodes an application/reports+json payload, which browsers
+// send as an array batching every queued report for the endpoint. A bare
+// object is accepted too. Each element becomes its own SecurityReport with
+// only that element in RawJSON.
+//
+// Elements that fail to parse are skipped: the reports that did parse are
+// returned alongside a joined error describing the rest.
+func ParseReports(data, srv string) ([]*SecurityReport, error) {
+	if !strings.HasPrefix(strings.TrimSpace(data), "[") {
+		sr, err := ParseReport(data, srv)
+		if err != nil {
+			return nil, err
+		}
+		return []*SecurityReport{sr}, nil
+	}
+
+	var items []json.RawMessage
+	if err := json.Unmarshal([]byte(data), &items); err != nil {
+		return nil, err
+	}
+
+	reports := make([]*SecurityReport, 0, len(items))
+	var errs []error
+	for i, item := range items {
+		sr, err := ParseReport(string(item), srv)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("report %d: %w", i, err))
+			continue
+		}
+		reports = append(reports, sr)
+	}
+	return reports, errors.Join(errs...)
 }
 
 // ParseLegacyCSPReport decodes a legacy application/csp-report payload

@@ -391,3 +391,19 @@ func TestLoginPageRenders(t *testing.T) {
 		t.Error("login page must not link or redirect to GitHub directly")
 	}
 }
+
+// The dashboard reports its own Web Vitals only once a "reportd" project
+// exists: otherwise the request is rejected on every page view.
+func TestSelfReportNeedsProject(t *testing.T) {
+	const beacon = "'/analytics/" + selfReportProject + "'"
+
+	h, _, _, _ := newProjectTestRouter(t, "blog")
+	if body := request(h, http.MethodGet, "/", "", "").Body.String(); strings.Contains(body, beacon) {
+		t.Error("page self-reports although the project does not exist")
+	}
+
+	h, _, _, _ = newProjectTestRouter(t, "blog", selfReportProject)
+	if body := request(h, http.MethodGet, "/", "", "").Body.String(); !strings.Contains(body, beacon) {
+		t.Error("page does not self-report although the project exists")
+	}
+}
