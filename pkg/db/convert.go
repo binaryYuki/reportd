@@ -1,6 +1,7 @@
 package db
 
 import (
+	"cmp"
 	"encoding/json"
 	"time"
 
@@ -12,6 +13,9 @@ import (
 const (
 	reportTypeCSP          = "csp"           // legacy Report-To CSP type
 	reportTypeCSPViolation = "csp-violation" // Reporting API v1 CSP type
+
+	// ReportTypeNetworkError is the Report-To type of NEL reports.
+	ReportTypeNetworkError = "network-error"
 )
 
 // WebVitalFromAnalytics converts an analytics.WebVital to its DB row.
@@ -76,8 +80,17 @@ func ReportToEntriesFromReport(r *reportto.Report) []*ReportToEntry {
 			SourceFile:         rt.Body.SourceFile,
 			LineNumber:         int(rt.Body.LineNumber),
 			ColumnNumber:       int(rt.Body.ColumnNumber),
-			StatusCode:         int(rt.Body.StatusCode),
+			StatusCode:         int(cmp.Or(rt.Body.StatusCode, rt.Body.Status)),
 			RawJSON:            JSONText(raw),
+		}
+		if rt.Type == ReportTypeNetworkError {
+			entry.NELType = rt.Body.Type
+			entry.Phase = rt.Body.Phase
+			entry.ElapsedTime = rt.Body.ElapsedTime
+			entry.SamplingFraction = rt.Body.SamplingFraction
+			entry.Method = rt.Body.Method
+			entry.Protocol = rt.Body.Protocol
+			entry.ServerIP = rt.Body.ServerIP
 		}
 		if rt.Body.Directive != "" {
 			entry.ViolatedDirective = rt.Body.Directive

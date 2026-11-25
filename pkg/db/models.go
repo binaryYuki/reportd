@@ -72,6 +72,15 @@ type ReportToEntry struct {
 	ColumnNumber       int            `json:"column_number"`
 	StatusCode         int            `json:"status_code"`
 	RawJSON            JSONText       `json:"raw_json,omitempty"`
+
+	// Network Error Logging (report_type "network-error") fields.
+	NELType          string  `gorm:"size:64" json:"nel_type,omitempty"` // "ok", "dns.name_not_resolved", "tcp.timed_out", "http.error", ...
+	Phase            string  `gorm:"size:16" json:"phase,omitempty"`    // "dns", "connection" or "application"
+	ElapsedTime      int64   `json:"elapsed_time,omitempty"`            // ms
+	SamplingFraction float64 `json:"sampling_fraction,omitempty"`
+	Method           string  `gorm:"size:16" json:"method,omitempty"`
+	Protocol         string  `gorm:"size:32" json:"protocol,omitempty"`
+	ServerIP         string  `gorm:"size:64" json:"server_ip,omitempty"`
 }
 
 // SecurityReportEntry is a row from POST /reporting (Reporting API v1).

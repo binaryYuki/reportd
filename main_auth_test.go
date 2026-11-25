@@ -157,7 +157,7 @@ func newProjectTestRouter(t *testing.T, names ...string) (http.Handler, *gorm.DB
 		t.Fatalf("AutoMigrate() error = %v", err)
 	}
 	for _, name := range names {
-		if err := db.CreateProject(ctx, pgDB, name); err != nil {
+		if err := db.CreateProject(ctx, pgDB, name, db.KindApp); err != nil {
 			t.Fatalf("CreateProject(%q) error = %v", name, err)
 		}
 	}
@@ -361,7 +361,7 @@ func TestProjectStoreReload(t *testing.T) {
 	ctx := context.Background()
 	_, pgDB, projects, _ := newProjectTestRouter(t, "blog")
 
-	if err := db.CreateProject(ctx, pgDB, "added-elsewhere"); err != nil {
+	if err := db.CreateProject(ctx, pgDB, "added-elsewhere", db.KindApp); err != nil {
 		t.Fatalf("CreateProject() error = %v", err)
 	}
 	if projects.Has("added-elsewhere") {
@@ -395,7 +395,8 @@ func TestLoginPageRenders(t *testing.T) {
 // The dashboard reports its own Web Vitals only once a "reportd" project
 // exists: otherwise the request is rejected on every page view.
 func TestSelfReportNeedsProject(t *testing.T) {
-	const beacon = "'/analytics/" + selfReportProject + "'"
+	// html/template escapes "/" inside JS strings.
+	const beacon = `sendBeacon('\/analytics?s=`
 
 	h, _, _, _ := newProjectTestRouter(t, "blog")
 	if body := request(h, http.MethodGet, "/", "", "").Body.String(); strings.Contains(body, beacon) {

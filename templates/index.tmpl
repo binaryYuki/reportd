@@ -41,6 +41,10 @@
         <p role="alert" class="mb-4 rounded-md bg-red-950 px-3 py-2 text-sm text-red-300 ring-1 ring-red-900">
           项目名只能包含字母、数字、“-” 和 “_”，最长 32 个字符。
         </p>
+        {{else if eq .Error "kind"}}
+        <p role="alert" class="mb-4 rounded-md bg-red-950 px-3 py-2 text-sm text-red-300 ring-1 ring-red-900">
+          请选择项目类型。
+        </p>
         {{else if .Error}}
         <p role="alert" class="mb-4 rounded-md bg-red-950 px-3 py-2 text-sm text-red-300 ring-1 ring-red-900">
           操作没有成功，请稍后再试。
@@ -49,13 +53,16 @@
 
         {{if .Services}}
         <ul id="projects" class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {{range $name := .Services}}
+          {{range .Projects}}
           <li>
-            <a href="/view/{{ $name }}" data-project="{{ $name }}"
+            <a href="/view/{{ .Name }}" data-project="{{ .Name }}" data-kind="{{ .Kind }}"
                class="group block rounded-lg bg-zinc-900 p-4 ring-1 ring-zinc-800 transition hover:ring-zinc-600">
-              <div class="flex items-center justify-between">
-                <span class="truncate font-medium">{{ $name }}</span>
-                <span aria-hidden="true" class="text-zinc-600 transition group-hover:translate-x-0.5 group-hover:text-zinc-300">&rarr;</span>
+              <div class="flex items-center justify-between gap-2">
+                <span class="truncate font-medium">{{ .Name }}</span>
+                <span class="flex shrink-0 items-center gap-2">
+                  {{if eq .Kind "api"}}<span class="rounded px-1.5 py-0.5 text-xs text-violet-300 ring-1 ring-violet-900">API</span>{{end}}
+                  <span aria-hidden="true" class="text-zinc-600 transition group-hover:translate-x-0.5 group-hover:text-zinc-300">&rarr;</span>
+                </span>
               </div>
               <div class="mt-3 flex min-h-6 flex-wrap gap-1.5" data-health></div>
             </a>
@@ -76,19 +83,43 @@
                    placeholder="例如 blog"
                    class="w-full rounded-md bg-zinc-900 px-3 py-2 text-sm text-zinc-100 ring-1 ring-zinc-700 placeholder:text-zinc-600 focus:ring-blue-500">
           </label>
+          <label>
+            <span class="mb-1 block text-sm text-zinc-400">类型</span>
+            <select name="kind" class="rounded-md bg-zinc-900 px-3 py-2 text-sm text-zinc-100 ring-1 ring-zinc-700 focus:ring-blue-500">
+              <option value="app">网站（App）</option>
+              <option value="api">纯 API</option>
+            </select>
+          </label>
           <button type="submit" class="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500">创建</button>
         </form>
-        <p class="mt-2 text-xs text-zinc-500">只有已创建的项目才接收上报；名字会出现在上报地址里。</p>
+        <p class="mt-2 text-xs text-zinc-500">网站接收性能指标、浏览器报告和网络错误；纯 API 只接收网络错误（NEL），用来看成功率。类型创建后不能修改。</p>
         {{end}}
       </main>
     </div>
 
     <script>
-      // 28-day averages per project, as rated chips for the three Core Web Vitals.
+      // Success-rate chip from the 30-day NEL estimate.
+      function networkChip(n) {
+        const rate = n.ok / n.requests;
+        const cls = rate >= 0.99 ? RATINGS.good : rate >= 0.95 ? RATINGS.okay : RATINGS.poor;
+        return el('span', {
+          class: 'rounded px-1.5 py-0.5 text-xs ring-1 ' + cls.chip,
+          title: '近 30 天估算请求成功率（按采样率加权）',
+        }, '成功率 ' + formatPercent(rate));
+      }
+
+      // 28-day averages per project, as rated chips for the three Core Web
+      // Vitals; API projects show their network success rate instead.
       try {
         const health = JSON.parse({{ .HealthJSON }});
+        const network = JSON.parse({{ .NetworkJSON }});
         document.querySelectorAll('[data-project]').forEach((card) => {
           const box = card.querySelector('[data-health]');
+          const net = network[card.dataset.project];
+          if (card.dataset.kind === 'api') {
+            box.append(net && net.requests > 0 ? networkChip(net) : el('span', { class: 'text-xs text-zinc-600' }, '暂无网络数据'));
+            return;
+          }
           const metrics = (health[card.dataset.project] || []).filter((m) => ['LCP', 'INP', 'CLS'].includes(m.metric));
           if (!metrics.length) {
             box.append(el('span', { class: 'text-xs text-zinc-600' }, '暂无性能数据'));

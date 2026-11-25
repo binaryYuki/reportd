@@ -98,7 +98,7 @@ func assertProjects(ctx context.Context, t *testing.T, d *gorm.DB, name string) 
 
 	// Creating twice must not fail or duplicate.
 	for range 2 {
-		if err := CreateProject(ctx, d, name); err != nil {
+		if err := CreateProject(ctx, d, name, KindApp); err != nil {
 			t.Fatalf("CreateProject() error = %v", err)
 		}
 	}

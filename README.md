@@ -45,6 +45,7 @@ reportd is configured via environment variables (prefix `REPORTD_`) or command-l
 | `REPORTD_GITHUB_CLIENT_SECRET` | `--github_client_secret` | Yes | GitHub OAuth app client secret |
 | `REPORTD_ALLOWED_EMAILS` | `--allowed_emails` | Yes | Comma-separated allowlist of emails that may sign in |
 | `REPORTD_SESSION_SECRET` | `--session_secret` | No | Secret (32+ characters) that signs session cookies. When unset a random one is generated at startup, so every restart signs everyone out |
+| `REPORTD_NAME_URLS` | `--name_urls` | No | Also accept `/report/<project>`-style ingestion URLs (default: `true`). Set `false` once every site uses the `?s=<token>` URLs |
 | `REPORTD_MAX_STORAGE_GB` | `--max_storage_gb` | No | Storage cap in GB (default: `5`). `0` disables the cap |
 | `REPORTD_PROJECT` | `--project` | No | GCP project ID. Setting it enables BigQuery forwarding |
 | `REPORTD_DATASET` | `--dataset` | With project | BigQuery dataset name |
@@ -57,11 +58,29 @@ reportd is configured via environment variables (prefix `REPORTD_`) or command-l
 
 Each site you monitor is a project. Projects are created and deleted in the dashboard and stored in the database; there is nothing to configure.
 
-A project has its own endpoints (`/analytics/blog`, `/reporting/blog`, `/report/blog`), its own page at `/view/blog`, and its own data; nothing is shared between projects. Names may use letters, digits, `-` and `_`, up to 32 characters. Each project page has an "接入方法" section with the exact script and headers to add to that site.
+A project has its own endpoints, its own page at `/view/blog`, and its own data; nothing is shared between projects. Names may use letters, digits, `-` and `_`, up to 32 characters. Each project page has an "接入方法" section with the exact script and headers to add to that site.
+
+### Project types
+
+A project is either a **website** (`app`) or a **pure API** (`api`), chosen when it is created:
+
+| | Website | Pure API |
+|---|---|---|
+| Web Vitals (`/analytics`) | Accepted | `422` |
+| Reporting API v1 page reports (`/reporting`: CSP, deprecation, …) | Accepted | `422` |
+| Report-To (`/report`) | Accepted | Only `network-error` (NEL) entries are kept; `422` if there are none |
+
+An API project's page shows only the network panel: the request success rate, estimated request volume, mean latency of successful and failed requests, failures by NEL type, by phase (DNS / connection / application) and by URL, and the latest failures. Browsers sample successes (`success_fraction`) and failures (`failure_fraction`) separately, so every number is weighted by `1 / sampling_fraction` rather than counting reports. NEL only covers requests made by Chromium-based browsers, for example `fetch` calls from a web page; server-to-server, mobile app and script traffic is not reported.
+
+### Ingestion URLs
+
+Every project has an opaque token, and each endpoint has a token form that does not reveal the project name: `/analytics?s=<token>`, `/reporting?s=<token>`, `/report?s=<token>`. The setup section on the project page uses these. A token can be regenerated from the project page; the old one stops working at once.
+
+The name form (`/analytics/blog`, …) keeps working while `REPORTD_NAME_URLS` is `true`, the default, so existing sites are not broken. Turn it off once every site has moved to token URLs; then only someone who knows a token can send reports.
 
 Only existing projects accept reports. Every route answers `404` for any other name, so nobody can create a project by posting to a new one. Deleting a project stops its ingestion at once and permanently deletes its data in the background.
 
-The dashboard reports its own Web Vitals and browser reports to a project named `reportd`; create it to collect them.
+The dashboard reports its own Web Vitals to a website project named `reportd`, using that project's token URL; create it to collect them.
 
 The top of the index page shows what arrived since your previous sign-in as three numbers: total, Web Vitals measurements, and browser reports. On a first sign-in it covers all stored data.
 
@@ -86,7 +105,7 @@ A GitHub account gets in when one of its **verified** emails is on the allowlist
 |--------|--------|
 | `GET /`, `GET /view/{service}` | Sign-in required; anonymous visitors are sent to the sign-in page |
 | `GET /api/*`, `GET /services`, `GET /reports/{service}`, `GET /analytics/{service}`, `GET /metrics` | Sign-in required; anonymous requests get `401` |
-| `POST /analytics/{service}`, `POST /report/{service}`, `POST /reporting/{service}`, `GET /api/status` | Public |
+| `POST /analytics/{service}`, `POST /report/{service}`, `POST /reporting/{service}`, the same paths with `?s=<token>` instead of `/{service}`, `GET /api/status` | Public |
 
 `/metrics` needs a session cookie, so a Prometheus scraper cannot read it directly.
 
@@ -255,9 +274,11 @@ Report-To: {"group":"default","max_age":10886400,"endpoints":[{"url":"https://yo
 
 | Endpoint | Content-Type | Description |
 |----------|-------------|-------------|
-| `POST /analytics/{service}` | `application/json` | Web Vitals data |
-| `POST /report/{service}` | `application/csp-report`, `application/expect-ct-report+json`, `application/reports+json` | Legacy Report-To data |
-| `POST /reporting/{service}` | `application/reports+json`, `application/csp-report` | Reporting API v1 data |
+| `POST /analytics/{service}` | `application/json` | Web Vitals data (website projects only) |
+| `POST /report/{service}` | `application/csp-report`, `application/expect-ct-report+json`, `application/reports+json` | Legacy Report-To data, including NEL |
+| `POST /reporting/{service}` | `application/reports+json`, `application/csp-report` | Reporting API v1 data (website projects only) |
+
+Each also answers at `/analytics?s=<token>`, `/report?s=<token>` and `/reporting?s=<token>`. Unknown projects and tokens get `404`; data an API project does not take gets `422`.
 
 ### Dashboard (GET, sign-in required except `/api/status`)
 
@@ -267,6 +288,7 @@ Report-To: {"group":"default","max_age":10886400,"endpoints":[{"url":"https://yo
 | `GET /view/{service}` | Dashboard for a specific service |
 | `GET /api/vitals/{service}` | JSON: p75 summaries and daily time series |
 | `GET /api/reports/{service}` | JSON: report counts, recent reports, top violated directives |
+| `GET /api/network/{service}` | JSON: 30-day NEL success rate, failure breakdowns, recent failures |
 | `GET /analytics/{service}` | JSON: daily average Web Vitals |
 | `GET /reports/{service}` | JSON: daily report counts |
 | `GET /services` | JSON: list of all services |
@@ -284,10 +306,11 @@ Report-To: {"group":"default","max_age":10886400,"endpoints":[{"url":"https://yo
 
 ## Dashboard features
 
-The index lists the projects, each with its rated Core Web Vitals, and has the form for creating one. A project page shows:
+The index lists the projects, each with its rated Core Web Vitals (or, for API projects, its network success rate), and has the form for creating one. A website project's page shows:
 
 - **Web Vitals tiles** for LCP, INP, CLS, FCP and TTFB: the trailing 28-day average rated against Google's thresholds (good / needs improvement / poor), with a 90-day trend line
 - **Report volume**: the total and a per-day bar chart for the last 90 days, plus a breakdown by report type
 - **Most violated CSP directives** over the last 30 days
 - **Recent reports**: the latest 20 across all types, with what happened and where
-- **Setup instructions** with the project's own endpoints filled in
+- **Network** success rate and failures, when the site sends NEL reports
+- **Setup instructions** with the project's own token URLs filled in

@@ -16,8 +16,10 @@ import (
 	"io/fs"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -106,6 +108,7 @@ func main() {
 	githubClientSecret := fs.String("github_client_secret", "", "GitHub OAuth app client secret.")
 	allowedEmails := fs.String("allowed_emails", "", "Comma-separated allowlist of verified GitHub emails that may sign in.")
 	sessionSecret := fs.String("session_secret", "", "Secret (32+ chars) signing session cookies. Random per start when unset.")
+	nameURLs := fs.Bool("name_urls", true, "Also accept reports at /report/<project>-style URLs; when false only the opaque ?s=<token> URLs work.")
 	maxStorageGB := fs.Float64("max_storage_gb", 5, "Storage cap in GB; the oldest rows are deleted beyond it. 0 disables the cap.")
 	if err := ff.Parse(fs, os.Args[1:], ff.WithEnvVarPrefix("REPORTD")); err != nil {
 		log.Fatalw("error parsing flags", zap.Error(err))
@@ -168,12 +171,22 @@ func main() {
 		log.Fatalw("could not auto-migrate database", zap.Error(err))
 	}
 	log.Infow("Database connected and migrated")
+	go func() {
+		backfillCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		defer cancel()
+		if n, err := db.BackfillNELFields(backfillCtx, pgDB); err != nil {
+			log.Warnw("backfilling network error fields", zap.Error(err), "rows", n)
+		} else if n > 0 {
+			log.Infow("backfilled network error fields", "rows", n)
+		}
+	}()
 
 	projects, err := newProjectStore(ctx, pgDB)
 	if err != nil {
 		log.Fatalw("could not load projects", zap.Error(err))
 	}
-	log.Infow("Projects loaded", "projects", projects.List())
+	projects.nameURLs = *nameURLs
+	log.Infow("Projects loaded", "projects", projects.List(), "name_urls", *nameURLs)
 
 	recordLogin := func(ctx context.Context, email string, at time.Time) (time.Time, error) {
 		return db.RecordLogin(ctx, pgDB, email, at)
@@ -327,6 +340,62 @@ func requireProject(projects *projectStore) func(http.Handler) http.Handler {
 	}
 }
 
+// projectFromToken resolves the opaque ?s=<token> of an ingestion URL to its
+// project and exposes it as the {service} URL parameter, so the handlers
+// serve both URL styles alike. Unknown tokens get 404.
+func projectFromToken(projects *projectStore) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			name, ok := projects.ByToken(r.URL.Query().Get("s"))
+			if !ok {
+				http.Error(w, "unknown project", http.StatusNotFound)
+				return
+			}
+			chi.RouteContext(r.Context()).URLParams.Add("service", name)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// nameIngest closes the /<kind>/{service} ingestion URLs when the
+// deployment only accepts token URLs.
+func nameIngest(projects *projectStore) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		if projects == nil {
+			return next
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !projects.nameURLs {
+				http.Error(w, "unknown project", http.StatusNotFound)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// statusWrongKind answers data an API project does not take (Web Vitals,
+// page reports). 422 rather than 404 so a misconfigured site is easy to
+// spot: the project exists, the data is wrong for it.
+const statusWrongKind = http.StatusUnprocessableEntity
+
+// appOnly rejects requests for API projects: Web Vitals and Reporting API
+// page reports only make sense for websites.
+func appOnly(projects *projectStore) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		if projects == nil {
+			return next
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if projects.Kind(chi.URLParam(r, "service")) == db.KindAPI {
+				http.Error(w, "api projects only accept network error (NEL) reports", statusWrongKind)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // enforceStorageLimitLoop prunes the oldest rows whenever the database grows
 // past maxBytes, checking at startup and then every interval until ctx ends.
 func enforceStorageLimitLoop(ctx context.Context, d *gorm.DB, maxBytes int64, interval time.Duration) {
@@ -405,7 +474,12 @@ func newRouter(pgDB *gorm.DB, ingest *db.Writer, writeReport reportToBQWriter, w
 		// project, but only once that project exists: otherwise every page
 		// view would log a rejected request in the browser console.
 		Funcs: []template.FuncMap{{
-			"selfReport": func() bool { return projects == nil || projects.Has(selfReportProject) },
+			"selfReportURL": func() string {
+				if projects == nil || projects.Kind(selfReportProject) != db.KindApp {
+					return ""
+				}
+				return "/analytics?s=" + url.QueryEscape(projects.Token(selfReportProject))
+			},
 		}},
 		Directory:  ".",
 		FileSystem: &render.EmbedFileSystem{FS: templates.FS},
@@ -437,26 +511,47 @@ func newRouter(pgDB *gorm.DB, ingest *db.Writer, writeReport reportToBQWriter, w
 	if projects != nil {
 		r.With(page, sameOrigin).Post("/projects", createProjectHandler(projects))
 		r.With(page, sameOrigin, project).Post("/projects/{service}/delete", deleteProjectHandler(projects))
+		r.With(page, sameOrigin, project).Post("/projects/{service}/token", rotateTokenHandler(projects))
 	}
 
 	r.With(page).Get("/", indexHandler(re, pgDB, projects))
-	r.With(page, project).Get("/view/{service}", viewHandler(re, projects != nil))
+	r.With(page, project).Get("/view/{service}", viewHandler(re, projects))
 	r.Get(statusPath, statusHandler(ingest))
 
-	r.With(project).Options("/report/{service}", corsPreflightHandler())
-	r.With(project).Options("/analytics/{service}", corsPreflightHandler())
+	// Ingestion. Every endpoint exists twice: under the project name, and
+	// under an opaque token (?s=) that reveals nothing about the project.
+	var kindOf func(string) string
+	if projects != nil {
+		kindOf = projects.Kind
+	}
+	postReport := postReportHandler(ingest, writeReport, kindOf)
+	postAnalytics := postAnalyticsHandler(ingest, writeAnalytics)
+	postReporting := postReportingHandler(ingest, writeSecurityReport)
+	appOnly := appOnly(projects)
 
+	named := r.With(nameIngest(projects), project)
+	named.Options("/report/{service}", corsPreflightHandler())
+	named.Options("/analytics/{service}", corsPreflightHandler())
+	named.Post("/report/{service}", postReport)
+	named.With(appOnly).Post("/analytics/{service}", postAnalytics)
+	named.With(appOnly).Post("/reporting/{service}", postReporting)
+
+	if projects != nil {
+		tokened := r.With(projectFromToken(projects))
+		r.Options("/report", corsPreflightHandler())
+		r.Options("/analytics", corsPreflightHandler())
+		tokened.Post("/report", postReport)
+		tokened.With(appOnly).Post("/analytics", postAnalytics)
+		tokened.With(appOnly).Post("/reporting", postReporting)
+	}
+
+	// Read APIs.
 	r.With(api, project).Get("/reports/{service}", getReportsHandler(pgDB))
-	r.With(project).Post("/report/{service}", postReportHandler(ingest, writeReport))
-
 	r.With(api).Get("/services", getServicesHandler(pgDB, projects))
 	r.With(api, project).Get("/analytics/{service}", getAnalyticsHandler(pgDB))
-	r.With(project).Post("/analytics/{service}", postAnalyticsHandler(ingest, writeAnalytics))
-
-	r.With(project).Post("/reporting/{service}", postReportingHandler(ingest, writeSecurityReport))
-
 	r.With(api, project).Get("/api/vitals/{service}", apiVitalsHandler(pgDB))
 	r.With(api, project).Get("/api/reports/{service}", apiReportsHandler(pgDB))
+	r.With(api, project).Get("/api/network/{service}", apiNetworkHandler(pgDB))
 
 	return r
 }
@@ -498,12 +593,21 @@ func createProjectHandler(projects *projectStore) http.HandlerFunc {
 			return
 		}
 
-		if err := projects.Create(ctx, name); err != nil {
+		kind := r.PostFormValue("kind")
+		if kind == "" {
+			kind = db.KindApp
+		}
+		if !db.ValidKind(kind) {
+			http.Redirect(w, r, "/?error=kind", http.StatusSeeOther)
+			return
+		}
+
+		if err := projects.Create(ctx, name, kind); err != nil {
 			l.Errorw("error creating project", zap.Error(err), "project", name)
 			http.Redirect(w, r, "/?error=storage", http.StatusSeeOther)
 			return
 		}
-		l.Infow("project created", "project", name, "by", auth.EmailFromContext(ctx))
+		l.Infow("project created", "project", name, "kind", kind, "by", auth.EmailFromContext(ctx))
 		http.Redirect(w, r, "/view/"+name, http.StatusSeeOther)
 	}
 }
@@ -523,6 +627,25 @@ func deleteProjectHandler(projects *projectStore) http.HandlerFunc {
 		}
 		l.Infow("project deleted", "project", name, "by", auth.EmailFromContext(ctx))
 		http.Redirect(w, r, "/", http.StatusSeeOther)
+	}
+}
+
+// rotateTokenHandler replaces a project's ingestion token and returns to
+// its page, which shows the new URLs.
+func rotateTokenHandler(projects *projectStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := queryContext(r.Context())
+		defer cancel()
+		l := logging.FromContext(ctx)
+		name := chi.URLParam(r, "service")
+
+		if err := projects.RotateToken(ctx, name); err != nil {
+			l.Errorw("error rotating project token", zap.Error(err), "project", name)
+			http.Redirect(w, r, "/view/"+name+"?error=storage", http.StatusSeeOther)
+			return
+		}
+		l.Infow("project token rotated", "project", name, "by", auth.EmailFromContext(ctx))
+		http.Redirect(w, r, "/view/"+name+"#setup", http.StatusSeeOther)
 	}
 }
 
@@ -575,11 +698,36 @@ func indexHandler(re *render.Render, pgDB *gorm.DB, projects *projectStore) http
 
 		healthJSON, _ := json.Marshal(shown)
 
+		network, err := db.GetAllServicesNetwork(ctx, pgDB)
+		if err != nil {
+			l.Errorw("error getting network rates", zap.Error(err))
+			network = make(map[string]db.NetworkRate)
+		}
+		type card struct {
+			Name string
+			Kind string
+		}
+		cards := make([]card, 0, len(services))
+		shownNetwork := make(map[string]db.NetworkRate, len(services))
+		for _, name := range services {
+			kind := db.KindApp
+			if projects != nil {
+				kind = projects.Kind(name)
+			}
+			cards = append(cards, card{Name: name, Kind: kind})
+			if n, ok := network[name]; ok {
+				shownNetwork[name] = n
+			}
+		}
+		networkJSON, _ := json.Marshal(shownNetwork)
+
 		if err := re.HTML(w, http.StatusOK, "index", struct {
-			Services   []string
-			HealthJSON string
-			User       string
-			Counts     db.IngestCounts
+			Services    []string
+			Projects    []card
+			HealthJSON  string
+			NetworkJSON string
+			User        string
+			Counts      db.IngestCounts
 			// HasSince is false when Counts covers all stored data.
 			HasSince bool
 			Since    string
@@ -595,6 +743,9 @@ func indexHandler(re *render.Render, pgDB *gorm.DB, projects *projectStore) http
 			User:       auth.EmailFromContext(r.Context()),
 			Services:   services,
 			HealthJSON: string(healthJSON),
+			Projects:   cards,
+			// NetworkJSON is the 30-day NEL volume per project.
+			NetworkJSON: string(networkJSON),
 		}); err != nil {
 			l.Errorw("error rendering index", zap.Error(err))
 			http.Error(w, "could not render index", 500)
@@ -603,7 +754,7 @@ func indexHandler(re *render.Render, pgDB *gorm.DB, projects *projectStore) http
 	}
 }
 
-func viewHandler(re *render.Render, canManage bool) http.HandlerFunc {
+func viewHandler(re *render.Render, projects *projectStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		l := logging.FromContext(r.Context())
 		service := chi.URLParam(r, "service")
@@ -614,16 +765,33 @@ func viewHandler(re *render.Render, canManage bool) http.HandlerFunc {
 			return
 		}
 
-		if err := re.HTML(w, http.StatusOK, "view", struct {
+		data := struct {
 			Service string
 			User    string
+			// Kind is "app" or "api".
+			Kind string
+			// Token is the opaque ingestion token; empty without a store.
+			Token string
+			// NameURLs is whether /<kind>/<name> ingestion URLs still work.
+			NameURLs bool
 			// CanManage is whether the project can be deleted here.
 			CanManage bool
+			Error     string
 		}{
-			CanManage: canManage,
+			CanManage: projects != nil,
 			User:      auth.EmailFromContext(r.Context()),
 			Service:   service,
-		}); err != nil {
+			Kind:      db.KindApp,
+			NameURLs:  true,
+			Error:     r.URL.Query().Get("error"),
+		}
+		if projects != nil {
+			data.Kind = projects.Kind(service)
+			data.Token = projects.Token(service)
+			data.NameURLs = projects.nameURLs
+		}
+
+		if err := re.HTML(w, http.StatusOK, "view", data); err != nil {
 			l.Errorw("error rendering view", zap.Error(err), "service", service)
 			http.Error(w, "could not render view", 500)
 			return
@@ -751,7 +919,10 @@ func handleBodyReadError(w http.ResponseWriter, r *http.Request, service string,
 	http.Error(w, "uploading error", http.StatusInternalServerError)
 }
 
-func postReportHandler(ingest *db.Writer, writeBQ reportToBQWriter) http.HandlerFunc {
+// postReportHandler takes legacy Report-To payloads. API projects (per
+// kindOf; nil treats every project as an app) keep only the network-error
+// (NEL) entries; a payload with nothing they accept is answered 422.
+func postReportHandler(ingest *db.Writer, writeBQ reportToBQWriter, kindOf func(string) string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		l := logging.FromContext(ctx)
@@ -780,7 +951,30 @@ func postReportHandler(ingest *db.Writer, writeBQ reportToBQWriter) http.Handler
 
 		l.Infow("report received", "content-type", ct, "service", service, "user-agent", r.UserAgent(), "report", data)
 
-		for _, entry := range db.ReportToEntriesFromReport(data) {
+		entries := db.ReportToEntriesFromReport(data)
+		if kindOf != nil && kindOf(service) == db.KindAPI {
+			kept := slices.DeleteFunc(slices.Clone(entries), func(e *db.ReportToEntry) bool {
+				return e.ReportType != db.ReportTypeNetworkError
+			})
+			if dropped := len(entries) - len(kept); dropped > 0 {
+				if len(kept) == 0 {
+					l.Warnw("api project received no network error reports", "service", service, "dropped", dropped)
+					http.Error(w, "api projects only accept network error (NEL) reports", statusWrongKind)
+					return
+				}
+				l.Infow("dropped non-network reports for api project", "service", service, "dropped", dropped)
+			}
+			entries = kept
+			data.ReportTo = slices.DeleteFunc(data.ReportTo, func(e *reportto.Entry) bool {
+				return e.Type != db.ReportTypeNetworkError
+			})
+		}
+		if len(entries) > maxReportsPerRequest {
+			l.Warnw("truncating oversized report batch", "service", service, "received", len(entries), "kept", maxReportsPerRequest)
+			entries = entries[:maxReportsPerRequest]
+		}
+
+		for _, entry := range entries {
 			ingest.Enqueue(entry)
 		}
 
@@ -981,6 +1175,30 @@ func apiVitalsHandler(pgDB *gorm.DB) http.HandlerFunc {
 
 		if err := writeJSON(w, out); err != nil {
 			l.Errorw("error writing vitals", zap.Error(err), "service", service)
+		}
+	}
+}
+
+func apiNetworkHandler(pgDB *gorm.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		l := logging.FromContext(ctx)
+		service := chi.URLParam(r, "service")
+
+		if err := lib.ValidateService(service); err != nil {
+			l.Warnw("invalid service", zap.Error(err), "service", service)
+			http.Error(w, "could not validate service", 400)
+			return
+		}
+
+		summary, err := db.GetNetworkSummary(ctx, pgDB, service)
+		if err != nil {
+			l.Errorw("error getting network summary", zap.Error(err), "service", service)
+			http.Error(w, "processing error", 500)
+			return
+		}
+		if err := writeJSON(w, summary); err != nil {
+			l.Errorw("error writing network summary", zap.Error(err), "service", service)
 		}
 	}
 }
