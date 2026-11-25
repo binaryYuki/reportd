@@ -435,8 +435,11 @@ func newRouter(pgDB *gorm.DB, ingest *db.Writer, writeReport reportToBQWriter, w
 
 	r.Use(cors.New(cors.Options{
 		// AllowCredentials must stay false to keep the wildcard origin safe (CORS bypass).
-		AllowCredentials:   false,
-		OptionsPassthrough: true,
+		AllowCredentials: false,
+		// Answer preflights here, before routing: they carry no body and,
+		// on ?s= URLs, nothing the routes could validate, and a browser that
+		// gets a non-2xx preflight drops the report.
+		OptionsPassthrough: false,
 		AllowedOrigins:     []string{"*"},
 		AllowedMethods:     []string{"GET", "POST", "OPTIONS"},
 		AllowedHeaders:     []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
@@ -538,8 +541,8 @@ func newRouter(pgDB *gorm.DB, ingest *db.Writer, writeReport reportToBQWriter, w
 
 	if projects != nil {
 		tokened := r.With(projectFromToken(projects))
-		r.Options("/report", corsPreflightHandler())
-		r.Options("/analytics", corsPreflightHandler())
+		tokened.Options("/report", corsPreflightHandler())
+		tokened.Options("/analytics", corsPreflightHandler())
 		tokened.Post("/report", postReport)
 		tokened.With(appOnly).Post("/analytics", postAnalytics)
 		tokened.With(appOnly).Post("/reporting", postReporting)
