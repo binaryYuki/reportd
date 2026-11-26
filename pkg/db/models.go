@@ -81,6 +81,10 @@ type ReportToEntry struct {
 	Method           string  `gorm:"size:16" json:"method,omitempty"`
 	Protocol         string  `gorm:"size:32" json:"protocol,omitempty"`
 	ServerIP         string  `gorm:"size:64" json:"server_ip,omitempty"`
+
+	// ClientIP is the address of the browser that sent the report, from
+	// Cloudflare's CF-Connecting-IP header; empty when absent or invalid.
+	ClientIP string `gorm:"size:64" json:"client_ip,omitempty"`
 }
 
 // SecurityReportEntry is a row from POST /reporting (Reporting API v1).

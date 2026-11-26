@@ -16,6 +16,7 @@ import (
 	"io/fs"
 	"mime"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
@@ -922,6 +923,16 @@ func handleBodyReadError(w http.ResponseWriter, r *http.Request, service string,
 	http.Error(w, "uploading error", http.StatusInternalServerError)
 }
 
+// cfConnectingIP returns the client address Cloudflare puts in
+// CF-Connecting-IP, or "" when the header is missing or not an IP.
+func cfConnectingIP(r *http.Request) string {
+	addr, err := netip.ParseAddr(strings.TrimSpace(r.Header.Get("CF-Connecting-IP")))
+	if err != nil {
+		return ""
+	}
+	return addr.Unmap().String()
+}
+
 // postReportHandler takes legacy Report-To payloads. API projects (per
 // kindOf; nil treats every project as an app) keep only the network-error
 // (NEL) entries; a payload with nothing they accept is answered 422.
@@ -977,7 +988,9 @@ func postReportHandler(ingest *db.Writer, writeBQ reportToBQWriter, kindOf func(
 			entries = entries[:maxReportsPerRequest]
 		}
 
+		clientIP := cfConnectingIP(r)
 		for _, entry := range entries {
+			entry.ClientIP = clientIP
 			ingest.Enqueue(entry)
 		}
 
