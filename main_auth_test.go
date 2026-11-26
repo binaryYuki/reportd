@@ -408,3 +408,62 @@ func TestSelfReportNeedsProject(t *testing.T) {
 		t.Error("page does not self-report although the project exists")
 	}
 }
+
+// Flushing deletes a project's stored data but keeps the project, its
+// token and ingestion; cross-site posts are refused.
+func TestFlushProject(t *testing.T) {
+	ctx := context.Background()
+	h, pgDB, projects, ingest := newProjectTestRouter(t, "blog", "shop")
+	token := projects.Token("blog")
+	for _, svc := range []string{"blog", "shop"} {
+		if rec := request(h, http.MethodPost, "/analytics/"+svc, "application/json", testVital); rec.Code != http.StatusNoContent {
+			t.Fatalf("POST /analytics/%s: status = %d", svc, rec.Code)
+		}
+	}
+	if err := ingest.Flush(ctx); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+	count := func(svc string) int64 {
+		t.Helper()
+		var n int64
+		if err := pgDB.Unscoped().Model(&db.WebVital{}).Where("service = ?", svc).Count(&n).Error; err != nil {
+			t.Fatalf("counting: %v", err)
+		}
+		return n
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/projects/blog/flush", nil)
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	cross := httptest.NewRecorder()
+	h.ServeHTTP(cross, req)
+	if cross.Code != http.StatusForbidden {
+		t.Fatalf("cross-site flush: status = %d, want 403", cross.Code)
+	}
+
+	rec := request(h, http.MethodPost, "/projects/blog/flush", formType, "")
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/view/blog?flushed=1" {
+		t.Fatalf("flush route: %d -> %q", rec.Code, rec.Header().Get("Location"))
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for projects.Flushing("blog") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if projects.Flushing("blog") {
+		t.Fatal("flush did not finish")
+	}
+	if n := count("blog"); n != 0 {
+		t.Errorf("blog rows after flush = %d, want 0", n)
+	}
+	if n := count("shop"); n != 1 {
+		t.Errorf("shop rows after flushing blog = %d, want 1", n)
+	}
+	if !projects.Has("blog") || projects.Token("blog") != token {
+		t.Error("flush should keep the project and its token")
+	}
+	if rec := request(h, http.MethodPost, "/analytics/blog", "application/json", testVital); rec.Code != http.StatusNoContent {
+		t.Errorf("POST after flush: status = %d, want 204", rec.Code)
+	}
+	if page := request(h, http.MethodGet, "/view/blog?flushed=1", "", "").Body.String(); !strings.Contains(page, "数据已清空") {
+		t.Error("project page should confirm the flush")
+	}
+}

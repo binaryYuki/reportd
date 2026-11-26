@@ -28,6 +28,11 @@
         {{if .Error}}
         <p role="alert" class="rounded-md bg-red-950 px-3 py-2 text-sm text-red-300 ring-1 ring-red-900">操作没有成功，请稍后再试。</p>
         {{end}}
+        {{if .Flushing}}
+        <p role="status" class="rounded-md bg-zinc-900 px-3 py-2 text-sm text-zinc-300 ring-1 ring-zinc-800">正在后台清空数据，稍后刷新页面查看。期间收到的新上报会保留。</p>
+        {{else if .Flushed}}
+        <p role="status" class="rounded-md bg-zinc-900 px-3 py-2 text-sm text-zinc-300 ring-1 ring-zinc-800">数据已清空。</p>
+        {{end}}
 
         <!-- Network: NEL success rate and failures. API projects show only this. -->
         <section id="network-section" aria-labelledby="h-network" {{if ne .Kind "api"}}hidden{{end}}>
@@ -88,12 +93,13 @@
             <div class="overflow-hidden rounded-lg bg-zinc-900 ring-1 ring-zinc-800">
               <h3 class="px-4 pt-4 text-sm font-medium text-zinc-400">最近的失败</h3>
               <div class="overflow-x-auto">
-                <table class="mt-2 w-full min-w-[40rem] table-fixed text-left text-sm">
+                <table class="mt-2 w-full min-w-[50rem] table-fixed text-left text-sm">
                   <thead class="text-xs text-zinc-500">
                     <tr>
                       <th scope="col" class="w-36 px-4 py-2 font-normal">时间</th>
                       <th scope="col" class="w-48 px-4 py-2 font-normal">错误</th>
                       <th scope="col" class="px-4 py-2 font-normal">地址</th>
+                      <th scope="col" class="w-40 px-4 py-2 font-normal">请求者 IP</th>
                       <th scope="col" class="w-24 px-4 py-2 font-normal">耗时</th>
                     </tr>
                   </thead>
@@ -223,7 +229,11 @@
 
         {{if .CanManage}}
         <section aria-labelledby="h-danger" class="border-t border-zinc-800 pt-6">
-          <h2 id="h-danger" class="sr-only">删除项目</h2>
+          <h2 id="h-danger" class="sr-only">清空数据与删除项目</h2>
+          <form id="flush" method="post" action="/projects/{{ .Service }}/flush" class="mb-4 flex flex-wrap items-center justify-between gap-3">
+            <p class="text-sm text-zinc-500">清空数据会永久删除目前已收到的全部上报，项目和上报地址保留不变。</p>
+            <button type="submit" {{if .Flushing}}disabled{{end}} class="rounded-md px-3 py-1.5 text-sm text-amber-300 ring-1 ring-amber-900 hover:bg-amber-950 disabled:cursor-not-allowed disabled:opacity-50">{{if .Flushing}}正在清空…{{else}}清空数据{{end}}</button>
+          </form>
           <form id="delete" method="post" action="/projects/{{ .Service }}/delete" class="flex flex-wrap items-center justify-between gap-3">
             <p class="text-sm text-zinc-500">删除项目会停止接收它的上报，并永久删除它的全部数据。</p>
             <button type="submit" class="rounded-md px-3 py-1.5 text-sm text-red-400 ring-1 ring-red-900 hover:bg-red-950">删除项目</button>
@@ -560,6 +570,7 @@ Permissions-Policy: camera=(), geolocation=(); report-to="default"`);
               when.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })),
             el('td', { class: 'truncate px-4 py-2', title: r.nel_type }, what),
             el('td', { class: 'truncate px-4 py-2 text-zinc-400', title: where + (r.server_ip ? ' → ' + r.server_ip : '') }, where),
+            el('td', { class: 'truncate px-4 py-2 font-mono text-xs text-zinc-400', title: r.client_ip || '' }, r.client_ip || '—'),
             el('td', { class: 'whitespace-nowrap px-4 py-2 text-zinc-400' }, r.elapsed_time ? formatMs(r.elapsed_time) : '—'));
         }));
         return true;
@@ -598,6 +609,13 @@ Permissions-Policy: camera=(), geolocation=(); report-to="default"`);
       if (rotate) {
         rotate.addEventListener('submit', (e) => {
           if (!confirm('重新生成后，使用旧令牌的上报地址会立即失效，需要更新所有站点的配置。继续吗？')) e.preventDefault();
+        });
+      }
+
+      const flush = document.getElementById('flush');
+      if (flush) {
+        flush.addEventListener('submit', (e) => {
+          if (!confirm('确定清空项目“' + SERVICE + '”目前的全部数据吗？删除后无法恢复，项目和上报地址保留。')) e.preventDefault();
         });
       }
 

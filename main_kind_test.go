@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -248,5 +250,35 @@ func TestBackfillNELFields(t *testing.T) {
 	}
 	if n, _ := db.BackfillNELFields(context.Background(), pgDB); n != 0 {
 		t.Errorf("second backfill updated %d rows, want 0", n)
+	}
+}
+
+// Recent failures carry the reporter's address from CF-Connecting-IP; a
+// header that is not an IP is dropped rather than stored.
+func TestNetworkFailureClientIP(t *testing.T) {
+	h, pgDB, _, ingest := newKindTestRouter(t)
+	for _, ip := range []string{"198.51.100.7", "not-an-ip"} {
+		req := httptest.NewRequest(http.MethodPost, "/report/api", strings.NewReader("["+nelTimeout+"]"))
+		req.Header.Set("Content-Type", "application/reports+json")
+		req.Header.Set("CF-Connecting-IP", ip)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("status = %d", rec.Code)
+		}
+	}
+	flushIngest(t, ingest)
+
+	s, err := db.GetNetworkSummary(context.Background(), pgDB, "api")
+	if err != nil {
+		t.Fatalf("GetNetworkSummary() error = %v", err)
+	}
+	var got []string
+	for _, f := range s.RecentFailures {
+		got = append(got, f.ClientIP)
+	}
+	slices.Sort(got)
+	if !slices.Equal(got, []string{"", "198.51.100.7"}) {
+		t.Errorf("client IPs = %q, want one 198.51.100.7 and one empty", got)
 	}
 }
