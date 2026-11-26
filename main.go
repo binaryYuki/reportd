@@ -516,6 +516,7 @@ func newRouter(pgDB *gorm.DB, ingest *db.Writer, writeReport reportToBQWriter, w
 		r.With(page, sameOrigin).Post("/projects", createProjectHandler(projects))
 		r.With(page, sameOrigin, project).Post("/projects/{service}/delete", deleteProjectHandler(projects))
 		r.With(page, sameOrigin, project).Post("/projects/{service}/token", rotateTokenHandler(projects))
+		r.With(page, sameOrigin, project).Post("/projects/{service}/flush", flushProjectHandler(projects))
 	}
 
 	r.With(page).Get("/", indexHandler(re, pgDB, projects))
@@ -631,6 +632,19 @@ func deleteProjectHandler(projects *projectStore) http.HandlerFunc {
 		}
 		l.Infow("project deleted", "project", name, "by", auth.EmailFromContext(ctx))
 		http.Redirect(w, r, "/", http.StatusSeeOther)
+	}
+}
+
+// flushProjectHandler starts deleting a project's stored data, keeping the
+// project, and returns to its page.
+func flushProjectHandler(projects *projectStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		l := logging.FromContext(r.Context())
+		name := chi.URLParam(r, "service")
+		if projects.Flush(name, nil) {
+			l.Infow("project flush started", "project", name, "by", auth.EmailFromContext(r.Context()))
+		}
+		http.Redirect(w, r, "/view/"+name+"?flushed=1", http.StatusSeeOther)
 	}
 }
 
@@ -781,6 +795,10 @@ func viewHandler(re *render.Render, projects *projectStore) http.HandlerFunc {
 			// CanManage is whether the project can be deleted here.
 			CanManage bool
 			Error     string
+			// Flushing is whether this project's data is being cleared;
+			// Flushed whether the user just asked for that.
+			Flushing bool
+			Flushed  bool
 		}{
 			CanManage: projects != nil,
 			User:      auth.EmailFromContext(r.Context()),
@@ -788,8 +806,10 @@ func viewHandler(re *render.Render, projects *projectStore) http.HandlerFunc {
 			Kind:      db.KindApp,
 			NameURLs:  true,
 			Error:     r.URL.Query().Get("error"),
+			Flushed:   r.URL.Query().Has("flushed"),
 		}
 		if projects != nil {
+			data.Flushing = projects.Flushing(service)
 			data.Kind = projects.Kind(service)
 			data.Token = projects.Token(service)
 			data.NameURLs = projects.nameURLs

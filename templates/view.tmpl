@@ -28,6 +28,11 @@
         {{if .Error}}
         <p role="alert" class="rounded-md bg-red-950 px-3 py-2 text-sm text-red-300 ring-1 ring-red-900">操作没有成功，请稍后再试。</p>
         {{end}}
+        {{if .Flushing}}
+        <p role="status" class="rounded-md bg-zinc-900 px-3 py-2 text-sm text-zinc-300 ring-1 ring-zinc-800">正在后台清空数据，稍后刷新页面查看。期间收到的新上报会保留。</p>
+        {{else if .Flushed}}
+        <p role="status" class="rounded-md bg-zinc-900 px-3 py-2 text-sm text-zinc-300 ring-1 ring-zinc-800">数据已清空。</p>
+        {{end}}
 
         <!-- Network: NEL success rate and failures. API projects show only this. -->
         <section id="network-section" aria-labelledby="h-network" {{if ne .Kind "api"}}hidden{{end}}>
@@ -224,7 +229,11 @@
 
         {{if .CanManage}}
         <section aria-labelledby="h-danger" class="border-t border-zinc-800 pt-6">
-          <h2 id="h-danger" class="sr-only">删除项目</h2>
+          <h2 id="h-danger" class="sr-only">清空数据与删除项目</h2>
+          <form id="flush" method="post" action="/projects/{{ .Service }}/flush" class="mb-4 flex flex-wrap items-center justify-between gap-3">
+            <p class="text-sm text-zinc-500">清空数据会永久删除目前已收到的全部上报，项目和上报地址保留不变。</p>
+            <button type="submit" {{if .Flushing}}disabled{{end}} class="rounded-md px-3 py-1.5 text-sm text-amber-300 ring-1 ring-amber-900 hover:bg-amber-950 disabled:cursor-not-allowed disabled:opacity-50">{{if .Flushing}}正在清空…{{else}}清空数据{{end}}</button>
+          </form>
           <form id="delete" method="post" action="/projects/{{ .Service }}/delete" class="flex flex-wrap items-center justify-between gap-3">
             <p class="text-sm text-zinc-500">删除项目会停止接收它的上报，并永久删除它的全部数据。</p>
             <button type="submit" class="rounded-md px-3 py-1.5 text-sm text-red-400 ring-1 ring-red-900 hover:bg-red-950">删除项目</button>
@@ -600,6 +609,13 @@ Permissions-Policy: camera=(), geolocation=(); report-to="default"`);
       if (rotate) {
         rotate.addEventListener('submit', (e) => {
           if (!confirm('重新生成后，使用旧令牌的上报地址会立即失效，需要更新所有站点的配置。继续吗？')) e.preventDefault();
+        });
+      }
+
+      const flush = document.getElementById('flush');
+      if (flush) {
+        flush.addEventListener('submit', (e) => {
+          if (!confirm('确定清空项目“' + SERVICE + '”目前的全部数据吗？删除后无法恢复，项目和上报地址保留。')) e.preventDefault();
         });
       }
 

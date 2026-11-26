@@ -131,12 +131,28 @@ func DeleteProject(ctx context.Context, d *gorm.DB, name string) error {
 // name, in batches so no single statement holds locks for long. It returns
 // how many rows went.
 func PurgeProjectData(ctx context.Context, d *gorm.DB, name string) (int64, error) {
+	return purgeProjectRows(ctx, d, name, time.Time{})
+}
+
+// FlushProjectData permanently deletes the rows stored for the service name
+// up to before, in batches like PurgeProjectData. Reports that arrive while
+// it runs are kept. It returns how many rows went.
+func FlushProjectData(ctx context.Context, d *gorm.DB, name string, before time.Time) (int64, error) {
+	return purgeProjectRows(ctx, d, name, before)
+}
+
+// purgeProjectRows deletes name's rows, only those created at or before
+// before unless it is zero.
+func purgeProjectRows(ctx context.Context, d *gorm.DB, name string, before time.Time) (int64, error) {
 	var total int64
 	for _, t := range retentionTables {
 		for {
 			var ids []uint
-			err := d.WithContext(ctx).Unscoped().Model(t.model).
-				Where("service = ?", name).Limit(pruneBatchSize).Pluck("id", &ids).Error
+			q := d.WithContext(ctx).Unscoped().Model(t.model).Where("service = ?", name)
+			if !before.IsZero() {
+				q = q.Where("created_at <= ?", before)
+			}
+			err := q.Limit(pruneBatchSize).Pluck("id", &ids).Error
 			if err != nil {
 				return total, fmt.Errorf("purging %s: %w", t.name, err)
 			}

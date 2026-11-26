@@ -27,6 +27,10 @@ type projectStore struct {
 	names   []string // sorted
 	byName  map[string]projectInfo
 	byToken map[string]string // token -> name
+
+	// flushing holds the projects whose data is being flushed, so repeated
+	// clicks do not start overlapping deletes.
+	flushing sync.Map // name -> struct{}
 }
 
 type projectInfo struct {
@@ -178,6 +182,38 @@ func (s *projectStore) Delete(ctx context.Context, name string, done chan<- stru
 		log.Infow("purged deleted project", "project", name, "rows_deleted", rows)
 	}()
 	return nil
+}
+
+// Flush deletes the project's stored data in the background, keeping the
+// project and its token. Reports arriving meanwhile are kept. It returns
+// false, starting nothing, when a flush of name is already running; done
+// (optional) is closed when the started flush ends.
+func (s *projectStore) Flush(name string, done chan<- struct{}) bool {
+	if _, running := s.flushing.LoadOrStore(name, struct{}{}); running {
+		return false
+	}
+	before := time.Now()
+	go func() {
+		defer s.flushing.Delete(name)
+		if done != nil {
+			defer close(done)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		rows, err := db.FlushProjectData(ctx, s.d, name, before)
+		if err != nil {
+			log.Errorw("flushing project data", "project", name, "rows_deleted", rows, zap.Error(err))
+			return
+		}
+		log.Infow("flushed project data", "project", name, "rows_deleted", rows)
+	}()
+	return true
+}
+
+// Flushing is whether a flush of name is running.
+func (s *projectStore) Flushing(name string) bool {
+	_, ok := s.flushing.Load(name)
+	return ok
 }
 
 // refreshLoop re-reads the database every interval until ctx ends. A failed
